@@ -36,11 +36,11 @@ pip install -r requirements.txt
 ## Формат данных
 
 Входной CSV (пример data.csv):
-	•	smiles — SMILES молекулы (строка, обязателен)
-	•	solv_smiles — SMILES растворителя (строка, опционально — пока не используется)
-	•	diel_const — диэлектрическая проницаемость растворителя (float)
-	•	conc_stand — концентрация, моль/л (float)
-	•	dc_stand — целевой dose constant (float), опционален для инференса
+•	smiles — SMILES молекулы (строка, обязателен)
+•	solv_smiles — SMILES растворителя (строка, опционально — пока не используется)
+•	diel_const — диэлектрическая проницаемость растворителя (float)
+•	conc_stand — концентрация, моль/л (float)
+•	dc_stand — целевой dose constant (float), опционален для инференса
 
 Минимум для предсказания: smiles, diel_const, conc_stand.
 
