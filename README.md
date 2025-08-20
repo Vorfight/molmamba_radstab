@@ -8,7 +8,7 @@
 - двухступенчатого SSL-предобучения (**SDA + e-semantic masked fusion**) и супервизед-обучения с **scaffold k-fold CV**.
 
 ## Дерево проекта
-
+```
 molmamba_radstab/
 ├── data.py
 ├── models/
@@ -23,7 +23,7 @@ molmamba_radstab/
 ├── main.py
 ├── requirements.txt
 └── runs/                 # создаётся автоматически
-
+```
 ## Установка
 
 ### Вариант 1 — через requirements.txt
@@ -36,11 +36,11 @@ pip install -r requirements.txt
 ## Формат данных
 
 Входной CSV (пример data.csv):
-•	smiles — SMILES молекулы (строка, обязателен)
-•	solv_smiles — SMILES растворителя (строка, опционально — пока не используется)
-•	diel_const — диэлектрическая проницаемость растворителя (float)
-•	conc_stand — концентрация, моль/л (float)
-•	dc_stand — целевой dose constant (float), опционален для инференса
+- smiles — SMILES молекулы (строка, обязателен)
+- solv_smiles — SMILES растворителя (строка, опционально — пока не используется)
+- diel_const — диэлектрическая проницаемость растворителя (float)
+- conc_stand — концентрация, моль/л (float)
+- dc_stand — целевой dose constant (float), опционален для инференса
 
 Минимум для предсказания: smiles, diel_const, conc_stand.
 
@@ -60,16 +60,15 @@ python train.py --csv data.csv --ssl_ckpt ssl_pretrained.pt \
   --folds 5 --epochs 300 --out_dir runs
 ```
 Что делает:
-	•	фолды по Bemis–Murcko scaffold (честная валидация по каркасам);
-	•	стандартизация числовых фич по train фолда;
-	•	early stopping по val_RMSE;
-	•	сохраняет runs/fold{k}_best.pt и runs/cv_summary.json.
+- фолды по **Bemis–Murcko scaffold** (честная валидация по каркасам);
+- стандартизация числовых фич **по train фолда**;
+- early stopping по `val_RMSE`;
+- сохраняет `runs/fold{k}_best.pt` и `runs/cv_summary.json`.
 
 Полезные флаги:
-	•	--d_model 128 и/или --dropout 0.2-0.4 для маленьких датасетов (у тебя 44 образца);
-	•	--folds 11 (мелкие scaffold-группы) — как LOO по каркасам;
-	•	--weight_decay 1e-3…1e-2, --patience 15-25 для жёстче ранней остановки.
-
+- `--d_model 128` и/или `--dropout 0.2-0.4` для маленьких датасетов (у тебя 44 образца);
+- `--folds 11` (мелкие scaffold-группы) — как LOO по каркасам;
+- `--weight_decay 1e-3…1e-2`, `--patience 15-25` для жёстче ранней остановки.
 
 ## Предсказания
 
