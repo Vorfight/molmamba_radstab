@@ -1,0 +1,285 @@
+# ssl_pretrain.py
+from __future__ import annotations
+import os
+import random
+import argparse
+from typing import Dict, Any
+
+import numpy as np
+import torch
+from torch import nn, Tensor
+from torch.utils.data import DataLoader
+
+from data import RadiationDataset, collate_batch, FeatureStandardizer
+from models.predictor import DoseConstantPredictor, build_from_sample
+
+
+# -----------------------------
+# Utils
+# -----------------------------
+def set_seed(seed: int = 42):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+
+def to_device(batch_pack, device: torch.device):
+    batch_pack.atom_batch = batch_pack.atom_batch.to(device)
+    batch_pack.frag_batch = batch_pack.frag_batch.to(device)
+    batch_pack.num_feats = batch_pack.num_feats.to(device)
+    if batch_pack.y is not None:
+        batch_pack.y = batch_pack.y.to(device)
+    return batch_pack
+
+
+def freeze_module(m: nn.Module, freeze: bool = True):
+    for p in m.parameters():
+        p.requires_grad = not freeze
+
+
+def save_checkpoint(path: str, model: DoseConstantPredictor, stdzr: FeatureStandardizer, args: Dict[str, Any]):
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    payload = {
+        "model_state_dict": model.state_dict(),
+        "standardizer_mean": stdzr.mean_.cpu().numpy() if stdzr.mean_ is not None else None,
+        "standardizer_std": stdzr.std_.cpu().numpy() if stdzr.std_ is not None else None,
+        "args": args,
+    }
+    torch.save(payload, path)
+    print(f"[✓] Saved checkpoint to {path}")
+
+
+# -----------------------------
+# Stage 1: Structural Distribution Alignment (CORAL on encoders)
+# -----------------------------
+def run_stage1_sda(
+    model: DoseConstantPredictor,
+    loader: DataLoader,
+    device: torch.device,
+    epochs: int = 50,
+    lr: float = 2e-4,
+    coral_weight: float = 1.0,
+    grad_clip: float = 1.0,
+):
+    # Train only encoders (freeze fuser + head)
+    freeze_module(model.fuser, True)
+    freeze_module(model.head, True)
+    freeze_module(model.atom_encoder, False)
+    freeze_module(model.frag_encoder, False)
+
+    optim = torch.optim.AdamW(
+        list(model.atom_encoder.parameters()) + list(model.frag_encoder.parameters()),
+        lr=lr, weight_decay=1e-4
+    )
+
+    model.train()
+    for epoch in range(1, epochs + 1):
+        total_loss = 0.0
+        n_batches = 0
+
+        for pack in loader:
+            pack = to_device(pack, device)
+
+            # Получаем эмбеддинги энкодеров без фьюзера
+            atom_vec = model.atom_encoder(pack.atom_batch)   # [B, D]
+            frag_vec = model.frag_encoder(pack.frag_batch)   # [B, D]
+
+            # CORAL alignment
+            xm = atom_vec - atom_vec.mean(0, keepdim=True)
+            xmt = frag_vec - frag_vec.mean(0, keepdim=True)
+            if xm.size(0) > 1 and xmt.size(0) > 1:
+                c1 = (xm.t() @ xm) / (xm.size(0) - 1)
+                c2 = (xmt.t() @ xmt) / (xmt.size(0) - 1)
+                loss = (c1 - c2).pow(2).mean() * coral_weight
+            else:
+                loss = atom_vec.new_tensor(0.0)
+
+            optim.zero_grad(set_to_none=True)
+            loss.backward()
+            if grad_clip is not None and grad_clip > 0:
+                torch.nn.utils.clip_grad_norm_(list(model.atom_encoder.parameters()) + list(model.frag_encoder.parameters()), grad_clip)
+            optim.step()
+
+            total_loss += float(loss.item())
+            n_batches += 1
+
+        avg = total_loss / max(1, n_batches)
+        print(f"[Stage1][Epoch {epoch:03d}] CORAL loss: {avg:.6f}")
+
+
+# -----------------------------
+# Stage 2: E‑Semantic Masked Fusion (reconstruct NUM)
+# -----------------------------
+def run_stage2_masked_fusion(
+    model: DoseConstantPredictor,
+    loader: DataLoader,
+    device: torch.device,
+    epochs: int = 80,
+    lr: float = 2e-4,
+    num_recon_weight: float = 1.0,
+    coral_hidden_weight: float = 0.1,
+    mask_prob_atom: float = 0.0,
+    mask_prob_frag: float = 0.0,
+    mask_prob_num: float = 0.15,
+    grad_clip: float = 1.0,
+):
+    # Размораживаем всё, кроме финальной головы (не нужна в SSL)
+    freeze_module(model.head, True)
+    freeze_module(model.fuser, False)
+    freeze_module(model.atom_encoder, False)
+    freeze_module(model.frag_encoder, False)
+
+    optim = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
+
+    model.train()
+    for epoch in range(1, epochs + 1):
+        total_num = 0.0
+        total_coral = 0.0
+        n_batches = 0
+
+        for pack in loader:
+            pack = to_device(pack, device)
+
+            # Маскирование модальностей для SSL
+            mask_cfg = {"atom": mask_prob_atom, "frag": mask_prob_frag, "num": mask_prob_num}
+
+            out = model(
+                atom_batch=pack.atom_batch,
+                frag_batch=pack.frag_batch,
+                num_feats=pack.num_feats,
+                ssl_mask_cfg=mask_cfg,
+                return_ssl=True,
+            )
+
+            # 1) MSE реконструкции NUM — только для замаскированных примеров
+            recon_num = out["recon_num"]               # [B, F]
+            mask_num = out["mask_num"]                 # [B] bool
+            if mask_num.sum() > 0:
+                diff = recon_num[mask_num] - pack.num_feats[mask_num]
+                loss_num = torch.mean(diff.pow(2)) * num_recon_weight
+            else:
+                loss_num = recon_num.new_tensor(0.0)
+
+            # 2) Доп. CORAL между скрытыми ATOM и FRAG токенами во фьюзере (слабый вес)
+            if ("atom_hidden" in out) and ("frag_hidden" in out):
+                ah = out["atom_hidden"]
+                fh = out["frag_hidden"]
+                ahm = ah - ah.mean(0, keepdim=True)
+                fhm = fh - fh.mean(0, keepdim=True)
+                if ah.size(0) > 1 and fh.size(0) > 1:
+                    c1 = (ahm.t() @ ahm) / (ah.size(0) - 1)
+                    c2 = (fhm.t() @ fhm) / (fh.size(0) - 1)
+                    loss_coral = (c1 - c2).pow(2).mean() * coral_hidden_weight
+                else:
+                    loss_coral = ah.new_tensor(0.0)
+            else:
+                loss_coral = out["fused"].new_tensor(0.0)
+
+            loss = loss_num + loss_coral
+
+            optim.zero_grad(set_to_none=True)
+            loss.backward()
+            if grad_clip is not None and grad_clip > 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+            optim.step()
+
+            total_num += float(loss_num.item())
+            total_coral += float(loss_coral.item())
+            n_batches += 1
+
+        avg_num = total_num / max(1, n_batches)
+        avg_cor = total_coral / max(1, n_batches)
+        print(f"[Stage2][Epoch {epoch:03d}] reconNUM: {avg_num:.6f} | coralHidden: {avg_cor:.6f}")
+
+
+# -----------------------------
+# Main
+# -----------------------------
+def main():
+    parser = argparse.ArgumentParser(description="Two-stage SSL pretraining: SDA + E-semantic masked fusion")
+    parser.add_argument("--csv", type=str, required=True, help="Path to CSV with columns: smiles, solv_smiles, diel_const, conc_stand, dc_stand")
+    parser.add_argument("--batch_size", type=int, default=16)
+    parser.add_argument("--epochs_sda", type=int, default=50)
+    parser.add_argument("--epochs_mask", type=int, default=80)
+    parser.add_argument("--lr_sda", type=float, default=2e-4)
+    parser.add_argument("--lr_mask", type=float, default=2e-4)
+    parser.add_argument("--num_recon_weight", type=float, default=1.0)
+    parser.add_argument("--coral_hidden_weight", type=float, default=0.1)
+    parser.add_argument("--mask_prob_atom", type=float, default=0.0)
+    parser.add_argument("--mask_prob_frag", type=float, default=0.0)
+    parser.add_argument("--mask_prob_num", type=float, default=0.15)
+    parser.add_argument("--d_model", type=int, default=256)
+    parser.add_argument("--gnn_layers", type=int, default=3)
+    parser.add_argument("--dropout", type=float, default=0.1)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--ckpt", type=str, default="ssl_pretrained.pt")
+    parser.add_argument("--num_workers", type=int, default=0)
+    args = parser.parse_args()
+
+    set_seed(args.seed)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    # Dataset & DataLoader
+    ds = RadiationDataset(args.csv)
+
+    # Стандартизатор числовых фич
+    stdzr = FeatureStandardizer().fit(ds)
+    # Оборачиваем DataLoader, чтобы сразу применять стандартизацию (через lambda в after-collate)
+    def collate_and_standardize(items):
+        pack = collate_batch(items)
+        pack.num_feats = stdzr.transform(pack.num_feats)
+        return pack
+
+    loader = DataLoader(
+        ds, batch_size=args.batch_size, shuffle=True,
+        num_workers=args.num_workers, collate_fn=collate_and_standardize, drop_last=False
+    )
+
+    # Инициализация модели по одному батчу
+    first_pack = next(iter(loader))
+    sample = {
+        "atom_batch": first_pack.atom_batch,
+        "frag_batch": first_pack.frag_batch,
+        "num_feats": first_pack.num_feats,
+    }
+    model = build_from_sample(
+        sample=sample,
+        d_model=args.d_model,
+        gnn_layers=args.gnn_layers,
+        dropout=args.dropout,
+        use_mamba_in_fuser=True,
+    ).to(device)
+
+    # Stage 1: SDA
+    run_stage1_sda(
+        model=model,
+        loader=loader,
+        device=device,
+        epochs=args.epochs_sda,
+        lr=args.lr_sda,
+        coral_weight=1.0,
+        grad_clip=1.0,
+    )
+
+    # Stage 2: E‑Semantic Masked Fusion
+    run_stage2_masked_fusion(
+        model=model,
+        loader=loader,
+        device=device,
+        epochs=args.epochs_mask,
+        lr=args.lr_mask,
+        num_recon_weight=args.num_recon_weight,
+        coral_hidden_weight=args.coral_hidden_weight,
+        mask_prob_atom=args.mask_prob_atom,
+        mask_prob_frag=args.mask_prob_frag,
+        mask_prob_num=args.mask_prob_num,
+        grad_clip=1.0,
+    )
+
+    # Save checkpoint
+    save_checkpoint(args.ckpt, model, stdzr, vars(args))
+
+
+if __name__ == "__main__":
+    main()

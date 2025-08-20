@@ -1,0 +1,214 @@
+# models/predictor.py
+from __future__ import annotations
+from typing import Optional, Dict, Any
+
+import torch
+from torch import nn, Tensor
+import torch.nn.functional as F
+
+from .mol_mamba import MolMambaEncoder
+from .frag_mamba import FragEncoder
+from .fuser import MambaTransformerFuser, coral_loss
+
+
+class DoseConstantPredictor(nn.Module):
+    """
+    Полный стек:
+      - atom_encoder: MolMambaEncoder (GNN -> node ordering -> Mamba/GRU -> pooling)
+      - frag_encoder: FragEncoder (GraphConv stack -> global pooling)
+      - fuser:       MambaTransformerFuser (tokens: [CLS, ATOM, FRAG, NUM])
+      - head:        регрессия в 1 значение (dose constant)
+
+    Параметры:
+      atom_in_dim, atom_edge_dim: размерности узлов и ребер атомного графа (из data.py)
+      frag_in_dim: размерность узла фрагментного графа (RDKit дескрипторы фрагмента)
+      num_feat_dim: размерность числовых фич (среда + RDKit дескрипторы молекулы)
+    """
+    def __init__(
+        self,
+        atom_in_dim: int,
+        atom_edge_dim: int,
+        frag_in_dim: int,
+        num_feat_dim: int,
+        d_model: int = 256,
+        gnn_layers: int = 3,
+        dropout: float = 0.1,
+        use_mamba_in_fuser: bool = True,
+    ):
+        super().__init__()
+        self.d_model = d_model
+        self.num_feat_dim = num_feat_dim
+
+        # 1) Энкодеры графов
+        self.atom_encoder = MolMambaEncoder(
+            in_node_dim=atom_in_dim,
+            edge_dim=atom_edge_dim,
+            hidden_dim=d_model,
+            gnn_layers=gnn_layers,
+            out_dim=d_model,
+            mamba_kwargs=None,
+            dropout=dropout,
+        )
+        self.frag_encoder = FragEncoder(
+            in_node_dim=frag_in_dim,
+            hidden_dim=d_model,
+            gnn_layers=gnn_layers,
+            out_dim=d_model,
+            dropout=dropout,
+        )
+
+        # 2) Фьюзер
+        self.fuser = MambaTransformerFuser(
+            d_model=d_model,
+            num_feat_dim=num_feat_dim,
+            out_dim=d_model,
+            dropout=dropout,
+            use_mamba=use_mamba_in_fuser,
+        )
+
+        # 3) Регрессионная голова
+        self.head = nn.Sequential(
+            nn.LayerNorm(d_model),
+            nn.Linear(d_model, d_model // 2),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_model // 2, 1),
+        )
+
+    @torch.no_grad()
+    def infer_embeddings(
+        self,
+        atom_batch,
+        frag_batch,
+        num_feats: Tensor,
+    ) -> Dict[str, Tensor]:
+        """
+        Возвращает промежуточные представления без градиентов:
+          - atom_vec, frag_vec, fused_vec (CLS после фьюзера)
+        """
+        self.eval()
+        atom_vec = self.atom_encoder(atom_batch)   # [B, D]
+        frag_vec = self.frag_encoder(frag_batch)   # [B, D]
+        fused_out = self.fuser(atom_vec, frag_vec, num_feats, mask_cfg=None, return_aux=False)
+        fused_vec = fused_out["fused"]             # [B, D]
+        return {"atom_vec": atom_vec, "frag_vec": frag_vec, "fused_vec": fused_vec}
+
+    def forward(
+        self,
+        atom_batch,
+        frag_batch,
+        num_feats: Tensor,                     # [B, F]
+        ssl_mask_cfg: Optional[Dict] = None,   # e.g., {"atom":0.15, "frag":0.15, "num":0.15}
+        return_ssl: bool = False,
+    ) -> Dict[str, Tensor]:
+        """
+        Возвращает:
+          - pred: [B, 1]
+          - (если return_ssl) дополнительные поля из фьюзера для SSL
+        """
+        atom_vec = self.atom_encoder(atom_batch)  # [B,D]
+        frag_vec = self.frag_encoder(frag_batch)  # [B,D]
+
+        fuser_out = self.fuser(
+            atom_vec=atom_vec,
+            frag_vec=frag_vec,
+            num_feats=num_feats,
+            mask_cfg=ssl_mask_cfg,
+            return_aux=return_ssl,
+        )
+        fused = fuser_out["fused"]                # [B,D]
+        pred = self.head(fused)                   # [B,1]
+
+        out = {"pred": pred}
+        if return_ssl:
+            out.update(fuser_out)
+        return out
+
+    @staticmethod
+    def ssl_losses(
+        fuser_out: Dict[str, Tensor],
+        ssl_weights: Dict[str, float] = None,
+    ) -> Dict[str, Tensor]:
+        """
+        Подсчёт SSL-лоссов:
+          - masked NUM reconstruction (MSE, только по тем, где mask_num=True)
+          - CORAL(ATOM, FRAG) — выравнивание распределений скрытых токенов
+        Аргументы:
+          fuser_out — результат forward(..., return_ssl=True)
+          ssl_weights — веса лоссов, например {"num_recon": 1.0, "coral": 0.1}
+        """
+        if ssl_weights is None:
+            ssl_weights = {"num_recon": 1.0, "coral": 0.1}
+
+        losses = {}
+        total = fuser_out["recon_num"].new_tensor(0.0)
+
+        # 1) Masked NUM reconstruction
+        recon = fuser_out["recon_num"]   # [B,F]
+        # Здесь ожидается, что при расчёте вы передадите GT num_feats в trainer-е.
+        # Чтобы получить MSE, нужен GT. Для удобства вернем хелпер: см. ниже `masked_num_recon_loss`.
+        losses["num_recon"] = recon.new_tensor(0.0)
+
+        # 2) CORAL между скрытыми представлениями ATOM и FRAG (если они доступны)
+        if ("atom_hidden" in fuser_out) and ("frag_hidden" in fuser_out):
+            coral = coral_loss(fuser_out["atom_hidden"], fuser_out["frag_hidden"])
+            losses["coral"] = coral * float(ssl_weights.get("coral", 0.1))
+            total = total + losses["coral"]
+        else:
+            losses["coral"] = recon.new_tensor(0.0)
+
+        losses["total"] = total + losses["num_recon"]
+        return losses
+
+    @staticmethod
+    def masked_num_recon_loss(
+        recon_num: Tensor,          # [B, F] из fuser_out
+        num_feats_gt: Tensor,       # [B, F] GT
+        mask_num: Tensor,           # [B] bool из fuser_out
+        weight: float = 1.0,
+    ) -> Tensor:
+        """
+        MSE только по тем примерам, где NUM токен был замаскирован.
+        """
+        if mask_num is None or mask_num.numel() == 0:
+            return recon_num.new_tensor(0.0)
+        if mask_num.sum() == 0:
+            return recon_num.new_tensor(0.0)
+        diff = recon_num[mask_num] - num_feats_gt[mask_num]
+        return weight * F.mse_loss(diff, torch.zeros_like(diff), reduction="mean")
+
+
+def build_from_sample(
+    sample: Dict[str, Any],
+    d_model: int = 256,
+    gnn_layers: int = 3,
+    dropout: float = 0.1,
+    use_mamba_in_fuser: bool = True,
+) -> DoseConstantPredictor:
+    """
+    Удобная фабрика: по одному батчу определяет нужные размерности.
+    Ожидает словарь с ключами:
+      - "atom_batch": PyG Batch (из collate_batch)
+      - "frag_batch": PyG Batch
+      - "num_feats":  Tensor[B, F]
+    """
+    atom_batch = sample["atom_batch"]
+    frag_batch = sample["frag_batch"]
+    num_feats = sample["num_feats"]
+
+    atom_in_dim = int(atom_batch.x.size(1))
+    atom_edge_dim = int(atom_batch.edge_attr.size(1))
+    frag_in_dim = int(frag_batch.x.size(1))
+    num_feat_dim = int(num_feats.size(1))
+
+    model = DoseConstantPredictor(
+        atom_in_dim=atom_in_dim,
+        atom_edge_dim=atom_edge_dim,
+        frag_in_dim=frag_in_dim,
+        num_feat_dim=num_feat_dim,
+        d_model=d_model,
+        gnn_layers=gnn_layers,
+        dropout=dropout,
+        use_mamba_in_fuser=use_mamba_in_fuser,
+    )
+    return model
