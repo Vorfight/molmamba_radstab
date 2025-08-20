@@ -165,7 +165,7 @@ def main():
     agg_embeds: Dict[str, List[np.ndarray]] = {"atom_vec": [], "frag_vec": [], "fused_vec": []} if args.save_embeddings else {}
 
     for i, ckpt_path in enumerate(ckpts, start=1):
-        payload = torch.load(ckpt_path, map_location="cpu")
+        payload = torch.load(ckpt_path, map_location="cpu", weights_only=False)
         state = payload.get("model_state_dict", payload)
 
         # Загрузка весов

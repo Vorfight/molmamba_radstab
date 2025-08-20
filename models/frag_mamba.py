@@ -42,7 +42,7 @@ class FragGNN(nn.Module):
         self.layers = nn.ModuleList()
         self.norms = nn.ModuleList()
         for _ in range(num_layers):
-            self.layers.append(GraphConv(hidden_dim, hidden_dim, aggr="add", normalize=True))
+            self.layers.append(GraphConv(hidden_dim, hidden_dim, aggr="add"))
             self.norms.append(nn.BatchNorm1d(hidden_dim))
         self.dropout = nn.Dropout(dropout)
 

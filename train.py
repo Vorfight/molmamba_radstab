@@ -108,7 +108,7 @@ def try_load_ssl_checkpoint(model: DoseConstantPredictor, standardizer: FeatureS
     if not ckpt_path or not os.path.isfile(ckpt_path):
         print(f"[i] SSL checkpoint not provided or not found: {ckpt_path}")
         return
-    payload = torch.load(ckpt_path, map_location="cpu")
+    payload = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     state = payload.get("model_state_dict", {})
     missing, unexpected = model.load_state_dict(state, strict=False)
     print(f"[✓] Loaded SSL weights from {ckpt_path}")

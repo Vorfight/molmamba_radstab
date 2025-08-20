@@ -11,8 +11,10 @@ from torch import Tensor
 from torch.utils.data import Dataset
 
 from rdkit import Chem
-from rdkit.Chem import rdMolDescriptors, Descriptors, Crippen, Lipinski, rdMolOps, rdmolops
+from rdkit.Chem import rdMolDescriptors, Descriptors, Crippen, Lipinski, rdmolops
 from rdkit.Chem.Scaffolds import MurckoScaffold
+from rdkit import RDLogger
+RDLogger.DisableLog('rdApp.*')
 
 from torch_geometric.data import Data, Batch
 
@@ -62,11 +64,15 @@ def safe_float(x: float) -> float:
 def smiles_to_mol(smi: str) -> Optional[Chem.Mol]:
     if not isinstance(smi, str) or not smi.strip():
         return None
-    mol = Chem.MolFromSmiles(smi)
-    if mol is None:
+    try:
+        # стандартная санитизация; RDKit сам корректно выставит ароматичность
+        mol = Chem.MolFromSmiles(smi, sanitize=True)
+        if mol is None:
+            return None
+        Chem.SanitizeMol(mol)  # на всякий случай, если SMILES кривоват
+        return mol
+    except Exception:
         return None
-    Chem.Kekulize(mol, clearAromaticFlags=False)
-    return mol
 
 def get_scaffold_smiles(smi: str, include_chirality: bool = False) -> str:
     mol = smiles_to_mol(smi)
