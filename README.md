@@ -9,7 +9,7 @@
 
 ## Дерево проекта
 
-project/
+molmamba_radstab/
 ├── data.py
 ├── models/
 │   ├── mol_mamba.py
@@ -70,7 +70,6 @@ python train.py --csv data.csv --ssl_ckpt ssl_pretrained.pt \
 	•	--folds 11 (мелкие scaffold-группы) — как LOO по каркасам;
 	•	--weight_decay 1e-3…1e-2, --patience 15-25 для жёстче ранней остановки.
 
-⸻
 
 ## Предсказания
 
