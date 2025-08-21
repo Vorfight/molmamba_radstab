@@ -1,0 +1,26 @@
+diff --git a/models/fuser.py b/models/fuser.py
+--- a/models/fuser.py
++++ b/models/fuser.py
+@@
+-def coral_loss(h1: torch.Tensor, h2: torch.Tensor) -> torch.Tensor:
+-    b1, d = h1.size()
+-    b2, d2 = h2.size()
+-    if d != d2 or b1 <= 1 or b2 <= 1:
+-        return h1.new_tensor(0.0)
+-    c1 = (h1.t() @ h1) / (b1 - 1)
+-    c2 = (h2.t() @ h2) / (b2 - 1)
+-    return (c1 - c2).pow(2).mean()
++def coral_loss(h1: torch.Tensor, h2: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
++    """CORAL with per-dim standardization for stability."""
++    b1, d = h1.size()
++    b2, d2 = h2.size()
++    if d != d2 or b1 <= 1 or b2 <= 1:
++        return h1.new_tensor(0.0)
++    def _std(x: torch.Tensor) -> torch.Tensor:
++        xm = x - x.mean(dim=0, keepdim=True)
++        return xm / (xm.std(dim=0, keepdim=True).clamp_min(eps))
++    h1n = _std(h1)
++    h2n = _std(h2)
++    c1 = (h1n.t() @ h1n) / (b1 - 1)
++    c2 = (h2n.t() @ h2n) / (b2 - 1)
++    return (c1 - c2).pow(2).mean()
