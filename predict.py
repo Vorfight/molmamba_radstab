@@ -192,13 +192,38 @@ def main():
 
         loader = DataLoader(ds, batch_size=args.batch_size, shuffle=False, num_workers=0, collate_fn=collate_and_standardize)
 
-        # Инференс
+        # inverse-transform from z-log to original scale
+        y_mean_log = payload.get("y_mean_log", 0.0)
+        y_std_log  = payload.get("y_std_log", 1.0)
+        @torch.no_grad()
+        def inverse_transform_pred(z: torch.Tensor) -> torch.Tensor:
+            y_log = z * y_std_log + y_mean_log
+            return torch.pow(10.0, y_log) - 1e-9
+
+        model.eval()
+        preds_all = []
         if args.save_embeddings:
-            preds_np, embeds = infer_with_embeddings(model, loader, device)
+            emb_atom, emb_frag, emb_fused = [], [], []
+        for pack in loader:
+            pack = to_device(pack, device)
+            out = model(atom_batch=pack.atom_batch, frag_batch=pack.frag_batch, num_feats=pack.num_feats,
+            ssl_mask_cfg=None, return_ssl=False)
+            z = out["pred"].squeeze(-1).detach().cpu()
+            preds_all.append(inverse_transform_pred(z).numpy())
+            if args.save_embeddings:
+                emb = model.infer_embeddings(pack.atom_batch, pack.frag_batch, pack.num_feats)
+                emb_atom.append(emb["atom_vec"].detach().cpu().numpy())
+                emb_frag.append(emb["frag_vec"].detach().cpu().numpy())
+                emb_fused.append(emb["fused_vec"].detach().cpu().numpy())
+        preds_np = np.concatenate(preds_all, axis=0)
+        if args.save_embeddings:
+            embeds = {
+                "atom_vec": np.concatenate(emb_atom, axis=0),
+                "frag_vec": np.concatenate(emb_frag, axis=0),
+                "fused_vec": np.concatenate(emb_fused, axis=0),
+                }
             for k in agg_embeds.keys():
                 agg_embeds[k].append(embeds[k])
-        else:
-            preds_np, _ = infer_once(model, loader, device)
 
         all_preds.append(preds_np)
 

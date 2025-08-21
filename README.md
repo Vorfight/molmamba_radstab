@@ -25,8 +25,6 @@ molmamba_radstab/
 └── runs/                 # создаётся автоматически
 ```
 ## Установка
-
-### Вариант 1 — через requirements.txt
 ```bash
 conda create -n molmamba_radstab python=3.10 -y
 conda activate molmamba_radstab

@@ -221,12 +221,24 @@ def mol_to_fragment_graph(mol: Chem.Mol) -> Data:
     return Data(x=x, edge_index=edge_index, edge_attr=edge_attr)
 
 # -----------------------------
-# Numeric features (environment + RDKit of main mol)
+# Numeric features (separate for molecule and solvent)
 # -----------------------------
-def numeric_features(mol: Chem.Mol, diel_const: float, conc_stand: float) -> np.ndarray:
+def numeric_features_mol(mol: Optional[Chem.Mol]) -> np.ndarray:
+    """RDKit descriptors of the main molecule ONLY (no solvent, no diel_const)."""
+    if mol is None:
+        return np.zeros((len(RDKit_DESC_FUNCS),), dtype=np.float32)
     desc = rdkit_descriptor_vector(mol)
-    env = [safe_float(diel_const), safe_float(conc_stand)]
-    return np.asarray(env + desc, dtype=np.float32)
+    return np.asarray(desc, dtype=np.float32)
+
+
+def numeric_features_solv(solv_mol: Optional[Chem.Mol], diel_const: float) -> np.ndarray:
+    """RDKit descriptors of solvent PLUS diel_const as the last element."""
+    if solv_mol is None:
+        desc = [0.0] * len(RDKit_DESC_FUNCS)
+    else:
+        desc = rdkit_descriptor_vector(solv_mol)
+    env = [safe_float(diel_const)]  # appended at the end
+    return np.asarray(desc + env, dtype=np.float32)
 
 # -----------------------------
 # Dataset
@@ -235,7 +247,13 @@ def numeric_features(mol: Chem.Mol, diel_const: float, conc_stand: float) -> np.
 class Item:
     atom_data: Data
     frag_data: Data
-    num_feats: Tensor  # shape [D]
+    # Combined numeric features: [num_mol | num_solv] where
+    #   num_mol  = RDKit descriptors of main molecule
+    #   num_solv = RDKit descriptors of solvent + [diel_const]
+    num_feats: Tensor          # shape [D_all]
+    num_feats_mol: Tensor      # shape [D_mol]
+    num_feats_solv: Tensor     # shape [D_solv]
+    conc: Tensor               # shape [1] (standardize outside)
     y: Optional[Tensor]
     meta: Dict
 
@@ -259,6 +277,10 @@ class RadiationDataset(Dataset):
         if "solv_smiles" not in self.df.columns:
             self.df["solv_smiles"] = ""
 
+        # Expose sizes of NUM splits
+        self.num_mol_dim = len(RDKit_DESC_FUNCS)
+        self.num_solv_dim = len(RDKit_DESC_FUNCS) + 1  # solvent RDKit + diel_const
+
         self._cache: List[Optional[Item]] = [None] * len(self.df)
 
     def __len__(self):
@@ -277,6 +299,7 @@ class RadiationDataset(Dataset):
         solv = str(row.get("solv_smiles", ""))
 
         mol = smiles_to_mol(smi)
+        solv_mol = smiles_to_mol(solv) if isinstance(solv, str) and solv.strip() else None
         if mol is None:
             # создадим пустой dummy-граф, чтобы не падать
             atom_data = Data(x=torch.zeros((1, len(ATOM_LIST) + 4 + len(HYBRIDIZATIONS) + 4), dtype=torch.float),
@@ -285,16 +308,21 @@ class RadiationDataset(Dataset):
             frag_data = Data(x=torch.zeros((1, len(RDKit_DESC_FUNCS)), dtype=torch.float),
                              edge_index=torch.tensor([[0], [0]], dtype=torch.long),
                              edge_attr=torch.ones(1, 1, dtype=torch.float))
-            numf = np.zeros((2 + len(RDKit_DESC_FUNCS),), dtype=np.float32)
         else:
             atom_data = mol_to_atom_graph(mol)
             frag_data = mol_to_fragment_graph(mol)
-            numf = numeric_features(mol, diel_const=diel, conc_stand=conc)
+
+        numf_mol = numeric_features_mol(mol)
+        numf_solv = numeric_features_solv(solv_mol, diel_const=diel)
+        numf_all = np.concatenate([numf_mol, numf_solv], axis=0)
 
         item = Item(
             atom_data=atom_data,
             frag_data=frag_data,
-            num_feats=torch.from_numpy(numf),
+            num_feats=torch.from_numpy(numf_all),
+            num_feats_mol=torch.from_numpy(numf_mol),
+            num_feats_solv=torch.from_numpy(numf_solv),
+            conc=torch.tensor([conc], dtype=torch.float),
             y=torch.tensor([yval], dtype=torch.float),
             meta={"smiles": smi, "solv_smiles": solv, "diel_const": diel, "conc_stand": conc}
         )
@@ -308,8 +336,11 @@ class RadiationDataset(Dataset):
 class BatchPack:
     atom_batch: Batch
     frag_batch: Batch
-    num_feats: Tensor  # [B, D]
-    y: Optional[Tensor]  # [B, 1]
+    num_feats: Tensor       # [B, D_all] = concat([mol, solv])
+    num_feats_mol: Tensor   # [B, D_mol]
+    num_feats_solv: Tensor  # [B, D_solv]
+    conc: Tensor            # [B, 1]
+    y: Optional[Tensor]     # [B, 1]
     meta: List[Dict]
 
 def collate_batch(items: List[Item]) -> BatchPack:
@@ -318,15 +349,20 @@ def collate_batch(items: List[Item]) -> BatchPack:
     atom_batch = Batch.from_data_list(atom_list)
     frag_batch = Batch.from_data_list(frag_list)
     num_feats = torch.stack([it.num_feats for it in items], dim=0)
+    num_feats_mol = torch.stack([it.num_feats_mol for it in items], dim=0)
+    num_feats_solv = torch.stack([it.num_feats_solv for it in items], dim=0)
+    conc = torch.stack([it.conc for it in items], dim=0).view(-1, 1)  # [B,1]
     y = torch.stack([it.y for it in items], dim=0) if items[0].y is not None else None
     meta = [it.meta for it in items]
-    return BatchPack(atom_batch=atom_batch, frag_batch=frag_batch, num_feats=num_feats, y=y, meta=meta)
+    return BatchPack(atom_batch=atom_batch, frag_batch=frag_batch,
+                     num_feats=num_feats, num_feats_mol=num_feats_mol, num_feats_solv=num_feats_solv,
+                     conc=conc, y=y, meta=meta)
 
 # -----------------------------
 # Optional: feature standardizer (для числовых признаков)
 # -----------------------------
 class FeatureStandardizer:
-    """Простая стандартизация (x - mean) / std для num_feats. Хранит параметры."""
+    """Простая стандартизация (x - mean) / std для комбинированных num_feats (молекула + растворитель). Хранит параметры."""
     def __init__(self):
         self.mean_: Optional[Tensor] = None
         self.std_: Optional[Tensor] = None

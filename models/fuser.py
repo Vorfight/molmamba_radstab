@@ -213,21 +213,20 @@ class MambaTransformerFuser(nn.Module):
 # -----------------------------
 # CORAL loss (для Structural Distribution Alignment)
 # -----------------------------
-def coral_loss(h1: Tensor, h2: Tensor) -> Tensor:
+def coral_loss(h1: torch.Tensor, h2: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
     """
-    CORAL: выравнивание ковариаций двух распределений.
-    h1, h2: [B, D]
+    CORAL with per-dim standardization → scale-invariant & numerically stable.
     """
-    B1, D1 = h1.size()
-    B2, D2 = h2.size()
-    assert D1 == D2, "Feature dims must match"
-    xm = h1 - h1.mean(dim=0, keepdim=True)  # [B1, D]
-    xmt = h2 - h2.mean(dim=0, keepdim=True) # [B2, D]
-    # Неконечные случаи
-    if B1 <= 1 or B2 <= 1:
-        return h1.new_tensor(0.0, requires_grad=True)
-
-    c1 = (xm.t() @ xm) / (B1 - 1)  # [D, D]
-    c2 = (xmt.t() @ xmt) / (B2 - 1)
-    loss = (c1 - c2).pow(2).mean()
-    return loss
+    b1, d = h1.size()
+    b2, d2 = h2.size()
+    if d != d2 or b1 <= 1 or b2 <= 1:
+        return h1.new_tensor(0.0)
+    def _std(x: torch.Tensor) -> torch.Tensor:
+        xm = x - x.mean(dim=0, keepdim=True)
+        xs = xm / (xm.std(dim=0, keepdim=True).clamp_min(eps))
+        return xs
+    h1n = _std(h1)
+    h2n = _std(h2)
+    c1 = (h1n.t() @ h1n) / (b1 - 1)
+    c2 = (h2n.t() @ h2n) / (b2 - 1)
+    return (c1 - c2).pow(2).mean()

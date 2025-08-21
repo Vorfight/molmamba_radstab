@@ -16,6 +16,13 @@ from torch.utils.data import DataLoader, Subset
 from data import RadiationDataset, collate_batch, FeatureStandardizer, scaffold_for_row
 from models.predictor import build_from_sample, DoseConstantPredictor
 
+EPS_Y = 1e-9
+
+def y_to_log10(y: torch.Tensor) -> torch.Tensor:
+    return torch.log10(torch.clamp(y, min=0.0) + EPS_Y)
+
+def y_from_log10(y_log: torch.Tensor) -> torch.Tensor:
+    return torch.pow(10.0, y_log) - EPS_Y
 
 # =============================
 # Utils
@@ -31,6 +38,8 @@ def to_device(pack, device: torch.device):
     pack.atom_batch = pack.atom_batch.to(device)
     pack.frag_batch = pack.frag_batch.to(device)
     pack.num_feats = pack.num_feats.to(device)
+    if hasattr(pack, "conc") and pack.conc is not None:
+        pack.conc = pack.conc.to(device)
     if pack.y is not None:
         pack.y = pack.y.to(device)
     return pack
@@ -136,6 +145,7 @@ def evaluate(model: DoseConstantPredictor, loader: DataLoader, device: torch.dev
                 atom_batch=pack.atom_batch,
                 frag_batch=pack.frag_batch,
                 num_feats=pack.num_feats,
+                conc=getattr(pack, "conc", None),
                 ssl_mask_cfg=None,
                 return_ssl=False,
             )
@@ -145,13 +155,17 @@ def evaluate(model: DoseConstantPredictor, loader: DataLoader, device: torch.dev
             y_pred_all.append(pred)
     y_true = np.concatenate(y_true_all, axis=0)
     y_pred = np.concatenate(y_pred_all, axis=0)
-    return {
+    out = {
         "RMSE": rmse(y_true, y_pred),
         "MAE": mae(y_true, y_pred),
         "R2": r2(y_true, y_pred),
-        "y_true": y_true,
-        "y_pred": y_pred,
     }
+    denom = np.maximum(np.abs(y_true), 1e-12)
+    out["RMSE_rel"] = float(np.sqrt(np.mean(((y_pred - y_true) / denom) ** 2)))
+    out["MAE_rel"]  = float(np.mean(np.abs((y_pred - y_true) / denom)))
+    out["y_true"] = y_true
+    out["y_pred"] = y_pred
+    return out
 
 
 # =============================
@@ -172,15 +186,43 @@ def train_one_fold(
     # Standardizer fit on train only
     stdzr = FeatureStandardizer().fit(ds, indices=train_idx)
 
+    # --- Target transform: log10 ---
+    # Фитим стандартизатор по train-части в лог-шкале (опционально).
+    # Если не хочешь стандартизировать таргет — просто оставь mean=0, std=1.
+    y_train_raw = torch.tensor([float(ds.df.iloc[i]["dc_stand"]) for i in train_idx], dtype=torch.float)
+    y_train_log = y_to_log10(y_train_raw)
+    y_mean = y_train_log.mean()
+    y_std = y_train_log.std().clamp_min(1e-8)
+
+    def transform_y(y: torch.Tensor) -> torch.Tensor:
+        return (y_to_log10(y) - y_mean) / y_std
+
+    def inverse_transform_y(y_hat_z: torch.Tensor) -> torch.Tensor:
+        y_hat_log = y_hat_z * y_std + y_mean
+        return y_from_log10(y_hat_log)
+
+    # --- Concentration standardization fit on train fold ---
+    conc_train = torch.tensor([float(ds.df.iloc[i]["conc_stand"]) for i in train_idx], dtype=torch.float)
+    conc_mean = conc_train.mean()
+    conc_std = conc_train.std().clamp_min(1e-8)
+
+    def transform_conc(c: torch.Tensor) -> torch.Tensor:
+        return (c - conc_mean) / conc_std
+
     def collate_and_standardize(items):
         pack = collate_batch(items)
         pack.num_feats = stdzr.transform(pack.num_feats)
+        if hasattr(pack, "conc") and pack.conc is not None:
+            pack.conc = transform_conc(pack.conc)
+        if pack.y is not None:
+            pack.y = transform_y(pack.y)
         return pack
 
     train_loader = DataLoader(
         ds_train, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers,
         collate_fn=collate_and_standardize, drop_last=False
     )
+
     val_loader = DataLoader(
         ds_val, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers,
         collate_fn=collate_and_standardize, drop_last=False
@@ -219,6 +261,7 @@ def train_one_fold(
                 atom_batch=pack.atom_batch,
                 frag_batch=pack.frag_batch,
                 num_feats=pack.num_feats,
+                conc=getattr(pack, "conc", None),
                 ssl_mask_cfg=None,
                 return_ssl=False,
             )
@@ -252,6 +295,10 @@ def train_one_fold(
                 "model": model.state_dict(),
                 "std_mean": stdzr.mean_.cpu().numpy(),
                 "std_std": stdzr.std_.cpu().numpy(),
+                "y_mean_log": float(y_mean.item()),
+                "y_std_log": float(y_std.item()),
+                "conc_mean": float(conc_mean.item()),
+                "conc_std": float(conc_std.item()),
                 "epoch": epoch,
                 "val_metrics": {k: float(v) for k, v in val_metrics.items() if isinstance(v, (int, float))},
                 "args": vars(args),

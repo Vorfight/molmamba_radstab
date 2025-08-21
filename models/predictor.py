@@ -66,13 +66,20 @@ class DoseConstantPredictor(nn.Module):
             use_mamba=use_mamba_in_fuser,
         )
 
-        # 3) Регрессионная голова
-        self.head = nn.Sequential(
-            nn.LayerNorm(d_model),
-            nn.Linear(d_model, d_model // 2),
-            nn.GELU(),
+        # 3) Encoder for concentration (scalar) and regression head conditioned on it
+        self.conc_mlp = nn.Sequential(
+            nn.Linear(1, d_model // 2),
+            nn.SiLU(),
             nn.Dropout(dropout),
-            nn.Linear(d_model // 2, 1),
+            nn.Linear(d_model // 2, d_model),
+        )
+
+        self.head = nn.Sequential(
+            nn.LayerNorm(2 * d_model),
+            nn.Linear(2 * d_model, d_model),
+            nn.SiLU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_model, 1),
         )
 
     @torch.no_grad()
@@ -98,6 +105,7 @@ class DoseConstantPredictor(nn.Module):
         atom_batch,
         frag_batch,
         num_feats: Tensor,                     # [B, F]
+        conc: Optional[Tensor] = None,         # [B, 1] standardized concentration (separate input)
         ssl_mask_cfg: Optional[Dict] = None,   # e.g., {"atom":0.15, "frag":0.15, "num":0.15}
         return_ssl: bool = False,
     ) -> Dict[str, Tensor]:
@@ -117,7 +125,15 @@ class DoseConstantPredictor(nn.Module):
             return_aux=return_ssl,
         )
         fused = fuser_out["fused"]                # [B,D]
-        pred = self.head(fused)                   # [B,1]
+
+        # Concentration as a separate conditioning input (if not provided, use zeros)
+        B = num_feats.size(0)
+        if conc is None:
+            conc = num_feats.new_zeros(B, 1)
+        conc_emb = self.conc_mlp(conc)           # [B,D]
+
+        fused_plus = torch.cat([fused, conc_emb], dim=-1)  # [B, 2D]
+        pred = self.head(fused_plus)              # [B,1]
 
         out = {"pred": pred}
         if return_ssl:

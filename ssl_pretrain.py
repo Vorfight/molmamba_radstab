@@ -12,6 +12,7 @@ from torch.utils.data import DataLoader
 
 from data import RadiationDataset, collate_batch, FeatureStandardizer
 from models.predictor import DoseConstantPredictor, build_from_sample
+from models.fuser import coral_loss
 
 
 # -----------------------------
@@ -28,6 +29,8 @@ def to_device(batch_pack, device: torch.device):
     batch_pack.atom_batch = batch_pack.atom_batch.to(device)
     batch_pack.frag_batch = batch_pack.frag_batch.to(device)
     batch_pack.num_feats = batch_pack.num_feats.to(device)
+    if hasattr(batch_pack, "conc") and batch_pack.conc is not None:
+        batch_pack.conc = batch_pack.conc.to(device)
     if batch_pack.y is not None:
         batch_pack.y = batch_pack.y.to(device)
     return batch_pack
@@ -62,9 +65,11 @@ def run_stage1_sda(
     coral_weight: float = 1.0,
     grad_clip: float = 1.0,
 ):
-    # Train only encoders (freeze fuser + head)
+    # Train only encoders (freeze fuser + head + conc_mlp)
     freeze_module(model.fuser, True)
     freeze_module(model.head, True)
+    if hasattr(model, "conc_mlp"):
+        freeze_module(model.conc_mlp, True)
     freeze_module(model.atom_encoder, False)
     freeze_module(model.frag_encoder, False)
 
@@ -86,12 +91,8 @@ def run_stage1_sda(
             frag_vec = model.frag_encoder(pack.frag_batch)   # [B, D]
 
             # CORAL alignment
-            xm = atom_vec - atom_vec.mean(0, keepdim=True)
-            xmt = frag_vec - frag_vec.mean(0, keepdim=True)
-            if xm.size(0) > 1 and xmt.size(0) > 1:
-                c1 = (xm.t() @ xm) / (xm.size(0) - 1)
-                c2 = (xmt.t() @ xmt) / (xmt.size(0) - 1)
-                loss = (c1 - c2).pow(2).mean() * coral_weight
+            if atom_vec.size(0) > 1 and frag_vec.size(0) > 1:
+                loss = coral_loss(atom_vec, frag_vec) * coral_weight
             else:
                 loss = atom_vec.new_tensor(0.0)
 
@@ -126,11 +127,16 @@ def run_stage2_masked_fusion(
 ):
     # Размораживаем всё, кроме финальной головы (не нужна в SSL)
     freeze_module(model.head, True)
+    if hasattr(model, "conc_mlp"):
+        freeze_module(model.conc_mlp, True)
     freeze_module(model.fuser, False)
     freeze_module(model.atom_encoder, False)
     freeze_module(model.frag_encoder, False)
 
     optim = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
+
+    # Determine molecular numeric dimensionality (for SSL reconstruction of molecule-only NUM)
+    num_mol_dim = None
 
     model.train()
     for epoch in range(1, epochs + 1):
@@ -152,11 +158,24 @@ def run_stage2_masked_fusion(
                 return_ssl=True,
             )
 
-            # 1) MSE реконструкции NUM — только для замаскированных примеров
-            recon_num = out["recon_num"]               # [B, F]
-            mask_num = out["mask_num"]                 # [B] bool
+            # 1) MSE реконструкции ТОЛЬКО молекулярной части NUM (исключаем растворитель)
+            #    Сравнение происходит в стандартизованной шкале: таргет берём из pack.num_feats[:, :num_mol_dim]
+            recon_num = out["recon_num"]               # [B, F_all]
+            mask_num = out["mask_num"]                 # [B] bool (sample-level masking)
+
+            # lazily determine num_mol_dim from the first batch
+            if num_mol_dim is None:
+                if hasattr(pack, "num_feats_mol"):
+                    num_mol_dim = pack.num_feats_mol.size(1)
+                else:
+                    raise RuntimeError("num_feats_mol is required in BatchPack to compute molecular SSL loss.")
+
+            # slice only molecular part
+            recon_mol = recon_num[:, :num_mol_dim]
+            tgt_mol   = pack.num_feats[:, :num_mol_dim]  # already standardized by collate_and_standardize
+
             if mask_num.sum() > 0:
-                diff = recon_num[mask_num] - pack.num_feats[mask_num]
+                diff = recon_mol[mask_num] - tgt_mol[mask_num]
                 loss_num = torch.mean(diff.pow(2)) * num_recon_weight
             else:
                 loss_num = recon_num.new_tensor(0.0)
@@ -165,12 +184,8 @@ def run_stage2_masked_fusion(
             if ("atom_hidden" in out) and ("frag_hidden" in out):
                 ah = out["atom_hidden"]
                 fh = out["frag_hidden"]
-                ahm = ah - ah.mean(0, keepdim=True)
-                fhm = fh - fh.mean(0, keepdim=True)
                 if ah.size(0) > 1 and fh.size(0) > 1:
-                    c1 = (ahm.t() @ ahm) / (ah.size(0) - 1)
-                    c2 = (fhm.t() @ fhm) / (fh.size(0) - 1)
-                    loss_coral = (c1 - c2).pow(2).mean() * coral_hidden_weight
+                    loss_coral = coral_loss(ah, fh) * coral_hidden_weight
                 else:
                     loss_coral = ah.new_tensor(0.0)
             else:
@@ -223,7 +238,10 @@ def main():
     # Dataset & DataLoader
     ds = RadiationDataset(args.csv)
 
-    # Стандартизатор числовых фич
+    # NUM features exclude concentration; we standardize the COMBINED num_feats ([mol | solv]).
+    # During SSL, reconstruction loss uses ONLY the molecular slice (num_feats_mol);
+    # solvent descriptors and diel_const do NOT participate in reconstruction.
+    # Concentration is not used during SSL (regression head is frozen).
     stdzr = FeatureStandardizer().fit(ds)
     # Оборачиваем DataLoader, чтобы сразу применять стандартизацию (через lambda в after-collate)
     def collate_and_standardize(items):
@@ -243,6 +261,7 @@ def main():
         "frag_batch": first_pack.frag_batch,
         "num_feats": first_pack.num_feats,
     }
+    # Note: concentration is deliberately not passed here; SSL does not use it and the regression head is frozen.
     model = build_from_sample(
         sample=sample,
         d_model=args.d_model,
