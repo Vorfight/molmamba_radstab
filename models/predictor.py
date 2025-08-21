@@ -16,20 +16,22 @@ class DoseConstantPredictor(nn.Module):
     Полный стек:
       - atom_encoder: MolMambaEncoder (GNN -> node ordering -> Mamba/GRU -> pooling)
       - frag_encoder: FragEncoder (GraphConv stack -> global pooling)
-      - fuser:       MambaTransformerFuser (tokens: [CLS, ATOM, FRAG, NUM])
+      - fuser:       MambaTransformerFuser (tokens: [CLS, ATOM, FRAG, NUM_MOL, NUM_SOLV])
       - head:        регрессия в 1 значение (dose constant)
 
     Параметры:
       atom_in_dim, atom_edge_dim: размерности узлов и ребер атомного графа (из data.py)
       frag_in_dim: размерность узла фрагментного графа (RDKit дескрипторы фрагмента)
-      num_feat_dim: размерность числовых фич (среда + RDKit дескрипторы молекулы)
+      num_feat_dim_mol: размерность числовых фич молекулы
+      num_feat_dim_solv: размерность числовых фич растворителя
     """
     def __init__(
         self,
         atom_in_dim: int,
         atom_edge_dim: int,
         frag_in_dim: int,
-        num_feat_dim: int,
+        num_feat_dim_mol: int,
+        num_feat_dim_solv: int,
         d_model: int = 256,
         gnn_layers: int = 3,
         dropout: float = 0.1,
@@ -37,7 +39,8 @@ class DoseConstantPredictor(nn.Module):
     ):
         super().__init__()
         self.d_model = d_model
-        self.num_feat_dim = num_feat_dim
+        self.num_feat_dim_mol = num_feat_dim_mol
+        self.num_feat_dim_solv = num_feat_dim_solv
 
         # 1) Энкодеры графов
         self.atom_encoder = MolMambaEncoder(
@@ -60,7 +63,8 @@ class DoseConstantPredictor(nn.Module):
         # 2) Фьюзер
         self.fuser = MambaTransformerFuser(
             d_model=d_model,
-            num_feat_dim=num_feat_dim,
+            num_feat_dim_mol=num_feat_dim_mol,
+            num_feat_dim_solv=num_feat_dim_solv,
             out_dim=d_model,
             dropout=dropout,
             use_mamba=use_mamba_in_fuser,
@@ -87,7 +91,8 @@ class DoseConstantPredictor(nn.Module):
         self,
         atom_batch,
         frag_batch,
-        num_feats: Tensor,
+        num_feats_mol: Tensor,
+        num_feats_solv: Tensor,
     ) -> Dict[str, Tensor]:
         """
         Возвращает промежуточные представления без градиентов:
@@ -96,7 +101,14 @@ class DoseConstantPredictor(nn.Module):
         self.eval()
         atom_vec = self.atom_encoder(atom_batch)   # [B, D]
         frag_vec = self.frag_encoder(frag_batch)   # [B, D]
-        fused_out = self.fuser(atom_vec, frag_vec, num_feats, mask_cfg=None, return_aux=False)
+        fused_out = self.fuser(
+            atom_vec=atom_vec,
+            frag_vec=frag_vec,
+            num_feats_mol=num_feats_mol,
+            num_feats_solv=num_feats_solv,
+            mask_cfg=None,
+            return_aux=False,
+        )
         fused_vec = fused_out["fused"]             # [B, D]
         return {"atom_vec": atom_vec, "frag_vec": frag_vec, "fused_vec": fused_vec}
 
@@ -104,9 +116,10 @@ class DoseConstantPredictor(nn.Module):
         self,
         atom_batch,
         frag_batch,
-        num_feats: Tensor,                     # [B, F]
+        num_feats_mol: Tensor,                 # [B, F_mol]
+        num_feats_solv: Tensor,                # [B, F_solv]
         conc: Optional[Tensor] = None,         # [B, 1] standardized concentration (separate input)
-        ssl_mask_cfg: Optional[Dict] = None,   # e.g., {"atom":0.15, "frag":0.15, "num":0.15}
+        ssl_mask_cfg: Optional[Dict] = None,   # e.g., {"atom":0.15, "frag":0.15, "num_mol":0.15}
         return_ssl: bool = False,
     ) -> Dict[str, Tensor]:
         """
@@ -120,16 +133,17 @@ class DoseConstantPredictor(nn.Module):
         fuser_out = self.fuser(
             atom_vec=atom_vec,
             frag_vec=frag_vec,
-            num_feats=num_feats,
+            num_feats_mol=num_feats_mol,
+            num_feats_solv=num_feats_solv,
             mask_cfg=ssl_mask_cfg,
             return_aux=return_ssl,
         )
         fused = fuser_out["fused"]                # [B,D]
 
         # Concentration as a separate conditioning input (if not provided, use zeros)
-        B = num_feats.size(0)
+        B = num_feats_mol.size(0)
         if conc is None:
-            conc = num_feats.new_zeros(B, 1)
+            conc = num_feats_mol.new_zeros(B, 1)
         conc_emb = self.conc_mlp(conc)           # [B,D]
 
         fused_plus = torch.cat([fused, conc_emb], dim=-1)  # [B, 2D]
@@ -157,13 +171,16 @@ class DoseConstantPredictor(nn.Module):
             ssl_weights = {"num_recon": 1.0, "coral": 0.1}
 
         losses = {}
-        total = fuser_out["recon_num"].new_tensor(0.0)
+        # use recon_num_mol if available; otherwise create a tensor on the same device via atom_hidden
+        base_t = fuser_out.get("recon_num_mol", None)
+        if base_t is None:
+            base_t = fuser_out.get("atom_hidden", None)
+        if base_t is None:
+            base_t = torch.tensor(0.0)
+        total = base_t.new_tensor(0.0)
 
-        # 1) Masked NUM reconstruction
-        recon = fuser_out["recon_num"]   # [B,F]
-        # Здесь ожидается, что при расчёте вы передадите GT num_feats в trainer-е.
-        # Чтобы получить MSE, нужен GT. Для удобства вернем хелпер: см. ниже `masked_num_recon_loss`.
-        losses["num_recon"] = recon.new_tensor(0.0)
+        # 1) Masked NUM reconstruction (molecule-only). Actual MSE computed in trainer via masked_num_recon_loss.
+        losses["num_recon"] = total.clone()
 
         # 2) CORAL между скрытыми представлениями ATOM и FRAG (если они доступны)
         if ("atom_hidden" in fuser_out) and ("frag_hidden" in fuser_out):
@@ -171,26 +188,26 @@ class DoseConstantPredictor(nn.Module):
             losses["coral"] = coral * float(ssl_weights.get("coral", 0.1))
             total = total + losses["coral"]
         else:
-            losses["coral"] = recon.new_tensor(0.0)
+            losses["coral"] = total.clone()
 
         losses["total"] = total + losses["num_recon"]
         return losses
 
     @staticmethod
     def masked_num_recon_loss(
-        recon_num: Tensor,          # [B, F] из fuser_out
-        num_feats_gt: Tensor,       # [B, F] GT
-        mask_num: Tensor,           # [B] bool из fuser_out
+        recon_num_mol: Tensor,      # [B, F_mol] из fuser_out
+        num_feats_mol_gt: Tensor,   # [B, F_mol] GT (standardized)
+        mask_num_mol: Tensor,       # [B] bool из fuser_out
         weight: float = 1.0,
     ) -> Tensor:
         """
-        MSE только по тем примерам, где NUM токен был замаскирован.
+        MSE по молекулярной части NUM только для замаскированных примеров.
         """
-        if mask_num is None or mask_num.numel() == 0:
-            return recon_num.new_tensor(0.0)
-        if mask_num.sum() == 0:
-            return recon_num.new_tensor(0.0)
-        diff = recon_num[mask_num] - num_feats_gt[mask_num]
+        if mask_num_mol is None or mask_num_mol.numel() == 0:
+            return recon_num_mol.new_tensor(0.0)
+        if mask_num_mol.sum() == 0:
+            return recon_num_mol.new_tensor(0.0)
+        diff = recon_num_mol[mask_num_mol] - num_feats_mol_gt[mask_num_mol]
         return weight * F.mse_loss(diff, torch.zeros_like(diff), reduction="mean")
 
 
@@ -206,22 +223,26 @@ def build_from_sample(
     Ожидает словарь с ключами:
       - "atom_batch": PyG Batch (из collate_batch)
       - "frag_batch": PyG Batch
-      - "num_feats":  Tensor[B, F]
+      - "num_feats_mol":  Tensor[B, F_mol]
+      - "num_feats_solv": Tensor[B, F_solv]
     """
     atom_batch = sample["atom_batch"]
     frag_batch = sample["frag_batch"]
-    num_feats = sample["num_feats"]
+    num_feats_mol = sample["num_feats_mol"]
+    num_feats_solv = sample["num_feats_solv"]
 
     atom_in_dim = int(atom_batch.x.size(1))
     atom_edge_dim = int(atom_batch.edge_attr.size(1))
     frag_in_dim = int(frag_batch.x.size(1))
-    num_feat_dim = int(num_feats.size(1))
+    num_feat_dim_mol = int(num_feats_mol.size(1))
+    num_feat_dim_solv = int(num_feats_solv.size(1))
 
     model = DoseConstantPredictor(
         atom_in_dim=atom_in_dim,
         atom_edge_dim=atom_edge_dim,
         frag_in_dim=frag_in_dim,
-        num_feat_dim=num_feat_dim,
+        num_feat_dim_mol=num_feat_dim_mol,
+        num_feat_dim_solv=num_feat_dim_solv,
         d_model=d_model,
         gnn_layers=gnn_layers,
         dropout=dropout,

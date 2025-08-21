@@ -28,7 +28,10 @@ def set_seed(seed: int = 42):
 def to_device(batch_pack, device: torch.device):
     batch_pack.atom_batch = batch_pack.atom_batch.to(device)
     batch_pack.frag_batch = batch_pack.frag_batch.to(device)
-    batch_pack.num_feats = batch_pack.num_feats.to(device)
+    if hasattr(batch_pack, "num_feats_mol") and batch_pack.num_feats_mol is not None:
+        batch_pack.num_feats_mol = batch_pack.num_feats_mol.to(device)
+    if hasattr(batch_pack, "num_feats_solv") and batch_pack.num_feats_solv is not None:
+        batch_pack.num_feats_solv = batch_pack.num_feats_solv.to(device)
     if hasattr(batch_pack, "conc") and batch_pack.conc is not None:
         batch_pack.conc = batch_pack.conc.to(device)
     if batch_pack.y is not None:
@@ -122,7 +125,8 @@ def run_stage2_masked_fusion(
     coral_hidden_weight: float = 0.1,
     mask_prob_atom: float = 0.0,
     mask_prob_frag: float = 0.0,
-    mask_prob_num: float = 0.15,
+    mask_prob_num_mol: float = 0.15,
+    mask_prob_num_solv: float = 0.0,
     grad_clip: float = 1.0,
 ):
     # Размораживаем всё, кроме финальной головы (не нужна в SSL)
@@ -148,37 +152,32 @@ def run_stage2_masked_fusion(
             pack = to_device(pack, device)
 
             # Маскирование модальностей для SSL
-            mask_cfg = {"atom": mask_prob_atom, "frag": mask_prob_frag, "num": mask_prob_num}
+            mask_cfg = {
+                "atom": mask_prob_atom,
+                "frag": mask_prob_frag,
+                "num_mol": mask_prob_num_mol,
+                "num_solv": mask_prob_num_solv,
+            }
 
             out = model(
                 atom_batch=pack.atom_batch,
                 frag_batch=pack.frag_batch,
-                num_feats=pack.num_feats,
+                num_feats_mol=pack.num_feats_mol,
+                num_feats_solv=pack.num_feats_solv,
                 ssl_mask_cfg=mask_cfg,
                 return_ssl=True,
             )
 
             # 1) MSE реконструкции ТОЛЬКО молекулярной части NUM (исключаем растворитель)
-            #    Сравнение происходит в стандартизованной шкале: таргет берём из pack.num_feats[:, :num_mol_dim]
-            recon_num = out["recon_num"]               # [B, F_all]
-            mask_num = out["mask_num"]                 # [B] bool (sample-level masking)
+            recon_mol = out["recon_num_mol"]          # [B, F_mol]
+            mask_num_mol = out.get("mask_num_mol", out.get("mask_num", None))  # [B] bool
+            tgt_mol = pack.num_feats_mol               # standardized in collate
 
-            # lazily determine num_mol_dim from the first batch
-            if num_mol_dim is None:
-                if hasattr(pack, "num_feats_mol"):
-                    num_mol_dim = pack.num_feats_mol.size(1)
-                else:
-                    raise RuntimeError("num_feats_mol is required in BatchPack to compute molecular SSL loss.")
-
-            # slice only molecular part
-            recon_mol = recon_num[:, :num_mol_dim]
-            tgt_mol   = pack.num_feats[:, :num_mol_dim]  # already standardized by collate_and_standardize
-
-            if mask_num.sum() > 0:
-                diff = recon_mol[mask_num] - tgt_mol[mask_num]
+            if mask_num_mol is not None and mask_num_mol.sum() > 0:
+                diff = recon_mol[mask_num_mol] - tgt_mol[mask_num_mol]
                 loss_num = torch.mean(diff.pow(2)) * num_recon_weight
             else:
-                loss_num = recon_num.new_tensor(0.0)
+                loss_num = recon_mol.new_tensor(0.0)
 
             # 2) Доп. CORAL между скрытыми ATOM и FRAG токенами во фьюзере (слабый вес)
             if ("atom_hidden" in out) and ("frag_hidden" in out):
@@ -205,7 +204,7 @@ def run_stage2_masked_fusion(
 
         avg_num = total_num / max(1, n_batches)
         avg_cor = total_coral / max(1, n_batches)
-        print(f"[Stage2][Epoch {epoch:03d}] reconNUM: {avg_num:.6f} | coralHidden: {avg_cor:.6f}")
+        print(f"[Stage2][Epoch {epoch:03d}] reconNUM_mol: {avg_num:.6f} | coralHidden: {avg_cor:.6f}")
 
 
 # -----------------------------
@@ -223,7 +222,8 @@ def main():
     parser.add_argument("--coral_hidden_weight", type=float, default=0.1)
     parser.add_argument("--mask_prob_atom", type=float, default=0.0)
     parser.add_argument("--mask_prob_frag", type=float, default=0.0)
-    parser.add_argument("--mask_prob_num", type=float, default=0.15)
+    parser.add_argument("--mask_prob_num_mol", type=float, default=0.15)
+    parser.add_argument("--mask_prob_num_solv", type=float, default=0.0)
     parser.add_argument("--d_model", type=int, default=256)
     parser.add_argument("--gnn_layers", type=int, default=3)
     parser.add_argument("--dropout", type=float, default=0.1)
@@ -235,19 +235,20 @@ def main():
     set_seed(args.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # Dataset & DataLoader
-    ds = RadiationDataset(args.csv)
+    # Standardize ONLY the molecular NUM part for SSL (solvent is excluded from SSL losses)
+    stdzr = FeatureStandardizer()
+    with torch.no_grad():
+        X = torch.stack([RadiationDataset(args.csv)[i].num_feats_mol for i in range(len(ds))], dim=0).float()
+        stdzr.mean_ = X.mean(dim=0)
+        stdzr.std_ = X.std(dim=0).clamp_min(1e-8)
 
-    # NUM features exclude concentration; we standardize the COMBINED num_feats ([mol | solv]).
-    # During SSL, reconstruction loss uses ONLY the molecular slice (num_feats_mol);
-    # solvent descriptors and diel_const do NOT participate in reconstruction.
-    # Concentration is not used during SSL (regression head is frozen).
-    stdzr = FeatureStandardizer().fit(ds)
-    # Оборачиваем DataLoader, чтобы сразу применять стандартизацию (через lambda в after-collate)
     def collate_and_standardize(items):
         pack = collate_batch(items)
-        pack.num_feats = stdzr.transform(pack.num_feats)
+        pack.num_feats_mol = stdzr.transform(pack.num_feats_mol)
+        # pack.num_feats_solv не трогаем в SSL
         return pack
+
+    ds = RadiationDataset(args.csv)
 
     loader = DataLoader(
         ds, batch_size=args.batch_size, shuffle=True,
@@ -259,7 +260,8 @@ def main():
     sample = {
         "atom_batch": first_pack.atom_batch,
         "frag_batch": first_pack.frag_batch,
-        "num_feats": first_pack.num_feats,
+        "num_feats_mol": first_pack.num_feats_mol,
+        "num_feats_solv": first_pack.num_feats_solv,
     }
     # Note: concentration is deliberately not passed here; SSL does not use it and the regression head is frozen.
     model = build_from_sample(
@@ -292,7 +294,8 @@ def main():
         coral_hidden_weight=args.coral_hidden_weight,
         mask_prob_atom=args.mask_prob_atom,
         mask_prob_frag=args.mask_prob_frag,
-        mask_prob_num=args.mask_prob_num,
+        mask_prob_num_mol=args.mask_prob_num_mol,
+        mask_prob_num_solv=args.mask_prob_num_solv,
         grad_clip=1.0,
     )
 

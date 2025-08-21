@@ -37,7 +37,10 @@ def set_seed(seed: int = 42):
 def to_device(pack, device: torch.device):
     pack.atom_batch = pack.atom_batch.to(device)
     pack.frag_batch = pack.frag_batch.to(device)
-    pack.num_feats = pack.num_feats.to(device)
+    if hasattr(pack, "num_feats_mol") and pack.num_feats_mol is not None:
+        pack.num_feats_mol = pack.num_feats_mol.to(device)
+    if hasattr(pack, "num_feats_solv") and pack.num_feats_solv is not None:
+        pack.num_feats_solv = pack.num_feats_solv.to(device)
     if hasattr(pack, "conc") and pack.conc is not None:
         pack.conc = pack.conc.to(device)
     if pack.y is not None:
@@ -105,7 +108,8 @@ def build_model_from_loader(loader: DataLoader, d_model: int, gnn_layers: int, d
     sample = {
         "atom_batch": first_pack.atom_batch,
         "frag_batch": first_pack.frag_batch,
-        "num_feats": first_pack.num_feats,
+        "num_feats_mol": first_pack.num_feats_mol,
+        "num_feats_solv": first_pack.num_feats_solv,
     }
     model = build_from_sample(
         sample=sample, d_model=d_model, gnn_layers=gnn_layers, dropout=dropout, use_mamba_in_fuser=True
@@ -113,7 +117,7 @@ def build_model_from_loader(loader: DataLoader, d_model: int, gnn_layers: int, d
     return model
 
 
-def try_load_ssl_checkpoint(model: DoseConstantPredictor, standardizer: FeatureStandardizer, ckpt_path: str):
+def try_load_ssl_checkpoint(model: DoseConstantPredictor, standardizer_mol: FeatureStandardizer, ckpt_path: str):
     if not ckpt_path or not os.path.isfile(ckpt_path):
         print(f"[i] SSL checkpoint not provided or not found: {ckpt_path}")
         return
@@ -129,12 +133,12 @@ def try_load_ssl_checkpoint(model: DoseConstantPredictor, standardizer: FeatureS
     mean_np = payload.get("standardizer_mean", None)
     std_np = payload.get("standardizer_std", None)
     if mean_np is not None and std_np is not None:
-        standardizer.mean_ = torch.tensor(mean_np, dtype=torch.float)
-        standardizer.std_ = torch.tensor(std_np, dtype=torch.float)
-        print("[✓] Loaded feature standardizer stats from SSL checkpoint.")
+        standardizer_mol.mean_ = torch.tensor(mean_np, dtype=torch.float)
+        standardizer_mol.std_ = torch.tensor(std_np, dtype=torch.float)
+        print("[✓] Loaded MOLECULAR feature standardizer stats from SSL checkpoint.")
 
 
-def evaluate(model: DoseConstantPredictor, loader: DataLoader, device: torch.device) -> Dict[str, float]:
+def evaluate(model: DoseConstantPredictor, loader: DataLoader, device: torch.device, inverse_transform_y) -> Dict[str, float]:
     model.eval()
     y_true_all: List[float] = []
     y_pred_all: List[float] = []
@@ -144,13 +148,16 @@ def evaluate(model: DoseConstantPredictor, loader: DataLoader, device: torch.dev
             out = model(
                 atom_batch=pack.atom_batch,
                 frag_batch=pack.frag_batch,
-                num_feats=pack.num_feats,
+                num_feats_mol=pack.num_feats_mol,
+                num_feats_solv=pack.num_feats_solv,
                 conc=getattr(pack, "conc", None),
                 ssl_mask_cfg=None,
                 return_ssl=False,
             )
-            pred = out["pred"].squeeze(-1).detach().cpu().numpy()
-            y = pack.y.squeeze(-1).detach().cpu().numpy()
+            pred_z = out["pred"].squeeze(-1)
+            y_z = pack.y.squeeze(-1)
+            pred = inverse_transform_y(pred_z).detach().cpu().numpy()
+            y = inverse_transform_y(y_z).detach().cpu().numpy()
             y_true_all.append(y)
             y_pred_all.append(pred)
     y_true = np.concatenate(y_true_all, axis=0)
@@ -183,8 +190,9 @@ def train_one_fold(
     ds_train = Subset(ds, train_idx)
     ds_val = Subset(ds, val_idx)
 
-    # Standardizer fit on train only
-    stdzr = FeatureStandardizer().fit(ds, indices=train_idx)
+    # Standardizers: molecular (from SSL), solvent (fit on train)
+    stdzr_mol = FeatureStandardizer()   # from SSL
+    stdzr_solv = FeatureStandardizer()  # fit on train
 
     # --- Target transform: log10 ---
     # Фитим стандартизатор по train-части в лог-шкале (опционально).
@@ -209,9 +217,16 @@ def train_one_fold(
     def transform_conc(c: torch.Tensor) -> torch.Tensor:
         return (c - conc_mean) / conc_std
 
+    # --- Solvent standardizer: fit on train ---
+    with torch.no_grad():
+        X_solv = torch.stack([ds[i].num_feats_solv for i in train_idx], dim=0).float()
+        stdzr_solv.mean_ = X_solv.mean(dim=0)
+        stdzr_solv.std_ = X_solv.std(dim=0).clamp_min(1e-8)
+
     def collate_and_standardize(items):
         pack = collate_batch(items)
-        pack.num_feats = stdzr.transform(pack.num_feats)
+        pack.num_feats_mol = stdzr_mol.transform(pack.num_feats_mol)
+        pack.num_feats_solv = stdzr_solv.transform(pack.num_feats_solv)
         if hasattr(pack, "conc") and pack.conc is not None:
             pack.conc = transform_conc(pack.conc)
         if pack.y is not None:
@@ -235,7 +250,7 @@ def train_one_fold(
 
     # Optionally load SSL checkpoint
     if args.ssl_ckpt:
-        try_load_ssl_checkpoint(model, stdzr, args.ssl_ckpt)
+        try_load_ssl_checkpoint(model, stdzr_mol, args.ssl_ckpt)
 
     # Optimizer & scheduler
     optim = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
@@ -260,7 +275,8 @@ def train_one_fold(
             out = model(
                 atom_batch=pack.atom_batch,
                 frag_batch=pack.frag_batch,
-                num_feats=pack.num_feats,
+                num_feats_mol=pack.num_feats_mol,
+                num_feats_solv=pack.num_feats_solv,
                 conc=getattr(pack, "conc", None),
                 ssl_mask_cfg=None,
                 return_ssl=False,
@@ -283,7 +299,7 @@ def train_one_fold(
         train_loss = total_loss / max(1, n_batches)
 
         # Evaluate
-        val_metrics = evaluate(model, val_loader, device)
+        val_metrics = evaluate(model, val_loader, device, inverse_transform_y)
         val_rmse = val_metrics["RMSE"]
 
         print(f"[Fold {fold_id}] Epoch {epoch:03d} | train_MSE: {train_loss:.6f} | val_RMSE: {val_rmse:.6f} | val_MAE: {val_metrics['MAE']:.6f} | val_R2: {val_metrics['R2']:.4f}")
@@ -293,8 +309,10 @@ def train_one_fold(
             best_val_rmse = val_rmse
             best_state = {
                 "model": model.state_dict(),
-                "std_mean": stdzr.mean_.cpu().numpy(),
-                "std_std": stdzr.std_.cpu().numpy(),
+                "std_mol_mean": stdzr_mol.mean_.cpu().numpy().tolist() if hasattr(stdzr_mol, "mean_") else None,
+                "std_mol_std":  stdzr_mol.std_.cpu().numpy().tolist() if hasattr(stdzr_mol, "std_") else None,
+                "std_solv_mean": stdzr_solv.mean_.cpu().numpy().tolist(),
+                "std_solv_std":  stdzr_solv.std_.cpu().numpy().tolist(),
                 "y_mean_log": float(y_mean.item()),
                 "y_std_log": float(y_std.item()),
                 "conc_mean": float(conc_mean.item()),
@@ -321,8 +339,8 @@ def train_one_fold(
     )
     val_eval_loader = val_loader
 
-    train_metrics = evaluate(model, train_eval_loader, device)
-    val_metrics = evaluate(model, val_eval_loader, device)
+    train_metrics = evaluate(model, train_eval_loader, device, inverse_transform_y)
+    val_metrics = evaluate(model, val_eval_loader, device, inverse_transform_y)
 
     # Save best
     os.makedirs(args.out_dir, exist_ok=True)

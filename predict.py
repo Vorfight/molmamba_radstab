@@ -17,7 +17,12 @@ from models.predictor import build_from_sample, DoseConstantPredictor
 def to_device(pack, device: torch.device):
     pack.atom_batch = pack.atom_batch.to(device)
     pack.frag_batch = pack.frag_batch.to(device)
-    pack.num_feats = pack.num_feats.to(device)
+    if hasattr(pack, "num_feats_mol") and pack.num_feats_mol is not None:
+        pack.num_feats_mol = pack.num_feats_mol.to(device)
+    if hasattr(pack, "num_feats_solv") and pack.num_feats_solv is not None:
+        pack.num_feats_solv = pack.num_feats_solv.to(device)
+    if hasattr(pack, "conc") and pack.conc is not None:
+        pack.conc = pack.conc.to(device)
     if pack.y is not None:
         pack.y = pack.y.to(device)
     return pack
@@ -44,61 +49,63 @@ def discover_checkpoints(ckpt: str) -> List[str]:
     raise FileNotFoundError(f"Checkpoint path not found: {ckpt}")
 
 
-def build_model_for_dataset(ds: RadiationDataset, batch_size: int, device: torch.device, d_model: int, gnn_layers: int, dropout: float) -> Tuple[DoseConstantPredictor, FeatureStandardizer, DataLoader]:
+def build_model_for_dataset(ds: RadiationDataset, batch_size: int, device: torch.device, d_model: int, gnn_layers: int, dropout: float) -> Tuple[DoseConstantPredictor, DataLoader]:
     """
     Создаёт DataLoader (без стандартизации), по первому батчу строит модель с корректными размерностями.
-    Возвращает (model, standardizer(fitted? no), loader_for_infer_without_std).
+    Возвращает (model, loader_for_infer_without_std).
     """
     loader = DataLoader(ds, batch_size=batch_size, shuffle=False, num_workers=0, collate_fn=collate_batch)
     first_pack = next(iter(loader))
     sample = {
         "atom_batch": first_pack.atom_batch,
         "frag_batch": first_pack.frag_batch,
-        "num_feats": first_pack.num_feats,
+        "num_feats_mol": first_pack.num_feats_mol,
+        "num_feats_solv": first_pack.num_feats_solv,
     }
     model = build_from_sample(sample, d_model=d_model, gnn_layers=gnn_layers, dropout=dropout, use_mamba_in_fuser=True).to(device)
-    stdzr = FeatureStandardizer()
-    return model, stdzr, loader
+    return model, loader
 
 
-def load_std_from_ckpt(stdzr: FeatureStandardizer, payload: Dict[str, Any]) -> bool:
-    mean_np = payload.get("standardizer_mean", None)
-    std_np = payload.get("standardizer_std", None)
-    if mean_np is None or std_np is None:
-        return False
-    stdzr.mean_ = torch.tensor(mean_np, dtype=torch.float)
-    stdzr.std_ = torch.tensor(std_np, dtype=torch.float)
-    return True
+def load_stats_from_ckpt(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Extract standardization and transform stats from checkpoint payload with safe fallbacks."""
+    stats = {}
+    # molecular num standardizer (from SSL)
+    stats["std_mol_mean"] = payload.get("std_mol_mean", payload.get("standardizer_mean", None))
+    stats["std_mol_std"]  = payload.get("std_mol_std",  payload.get("standardizer_std", None))
+    # solvent num standardizer (from supervised fold)
+    stats["std_solv_mean"] = payload.get("std_solv_mean", None)
+    stats["std_solv_std"]  = payload.get("std_solv_std", None)
+    # target (log10 z) and concentration transforms
+    stats["y_mean_log"] = payload.get("y_mean_log", None)
+    stats["y_std_log"]  = payload.get("y_std_log", None)
+    stats["conc_mean"]  = payload.get("conc_mean", None)
+    stats["conc_std"]   = payload.get("conc_std", None)
+    return stats
 
 
 @torch.no_grad()
-def infer_once(model: DoseConstantPredictor, loader: DataLoader, device: torch.device) -> Tuple[np.ndarray, Dict[str, np.ndarray]]:
+def infer_once(model: DoseConstantPredictor, loader: DataLoader, device: torch.device, inverse_transform_pred) -> Tuple[np.ndarray, Dict[str, np.ndarray]]:
     model.eval()
     preds: List[np.ndarray] = []
-    # Для эмбеддингов (если включено позже)
-    atom_list: List[np.ndarray] = []
-    frag_list: List[np.ndarray] = []
-    fused_list: List[np.ndarray] = []
-
     for pack in loader:
         pack = to_device(pack, device)
         out = model(
             atom_batch=pack.atom_batch,
             frag_batch=pack.frag_batch,
-            num_feats=pack.num_feats,
+            num_feats_mol=pack.num_feats_mol,
+            num_feats_solv=pack.num_feats_solv,
+            conc=getattr(pack, "conc", None),
             ssl_mask_cfg=None,
             return_ssl=False,
         )
-        pred = out["pred"].squeeze(-1).detach().cpu().numpy()
-        preds.append(pred)
-
+        z = out["pred"].squeeze(-1)
+        preds.append(inverse_transform_pred(z).cpu().numpy())
     preds_np = np.concatenate(preds, axis=0)
-    embeds = {}
-    return preds_np, embeds
+    return preds_np, {}
 
 
 @torch.no_grad()
-def infer_with_embeddings(model: DoseConstantPredictor, loader: DataLoader, device: torch.device) -> Tuple[np.ndarray, Dict[str, np.ndarray]]:
+def infer_with_embeddings(model: DoseConstantPredictor, loader: DataLoader, device: torch.device, inverse_transform_pred) -> Tuple[np.ndarray, Dict[str, np.ndarray]]:
     model.eval()
     preds: List[np.ndarray] = []
     atom_list: List[np.ndarray] = []
@@ -106,22 +113,21 @@ def infer_with_embeddings(model: DoseConstantPredictor, loader: DataLoader, devi
     fused_list: List[np.ndarray] = []
     for pack in loader:
         pack = to_device(pack, device)
-        # предсказание
         out = model(
             atom_batch=pack.atom_batch,
             frag_batch=pack.frag_batch,
-            num_feats=pack.num_feats,
+            num_feats_mol=pack.num_feats_mol,
+            num_feats_solv=pack.num_feats_solv,
+            conc=getattr(pack, "conc", None),
             ssl_mask_cfg=None,
             return_ssl=False,
         )
-        pred = out["pred"].squeeze(-1).detach().cpu().numpy()
-        preds.append(pred)
-        # эмбеддинги
-        emb = model.infer_embeddings(pack.atom_batch, pack.frag_batch, pack.num_feats)
+        z = out["pred"].squeeze(-1)
+        preds.append(inverse_transform_pred(z).cpu().numpy())
+        emb = model.infer_embeddings(pack.atom_batch, pack.frag_batch, pack.num_feats_mol, pack.num_feats_solv)
         atom_list.append(emb["atom_vec"].detach().cpu().numpy())
         frag_list.append(emb["frag_vec"].detach().cpu().numpy())
         fused_list.append(emb["fused_vec"].detach().cpu().numpy())
-
     preds_np = np.concatenate(preds, axis=0)
     embeds = {
         "atom_vec": np.concatenate(atom_list, axis=0),
@@ -151,7 +157,7 @@ def main():
     ds = RadiationDataset(args.csv)
 
     # Поднимаем модель под размерности датасета (по первому батчу)
-    model, stdzr, base_loader = build_model_for_dataset(
+    model, base_loader = build_model_for_dataset(
         ds, batch_size=args.batch_size, device=device, d_model=args.d_model, gnn_layers=args.gnn_layers, dropout=args.dropout
     )
 
@@ -166,7 +172,7 @@ def main():
 
     for i, ckpt_path in enumerate(ckpts, start=1):
         payload = torch.load(ckpt_path, map_location="cpu", weights_only=False)
-        state = payload.get("model_state_dict", payload)
+        state = payload.get("model", payload.get("model_state_dict", payload))
 
         # Загрузка весов
         missing, unexpected = model.load_state_dict(state, strict=False)
@@ -177,28 +183,52 @@ def main():
                 print(f"[i] Unexpected {len(unexpected)} keys (showing first 10): {unexpected[:10]}")
         print(f"[✓] Loaded checkpoint ({i}/{len(ckpts)}): {ckpt_path}")
 
-        # Стандартизатор: из чекпоинта или fit по всему входному CSV (fallback)
-        ok_std = load_std_from_ckpt(stdzr, payload)
-        if not ok_std:
-            # fallback: fit на inference‑датасете (лучше, чем ничего)
-            stdzr.fit(ds)
-            print("[!] Standardizer stats not found in ckpt — fitted on input CSV.")
+        stats = load_stats_from_ckpt(payload)
+        # Prepare tensors for standardization; fallbacks if missing
+        std_mol_mean = torch.tensor(stats["std_mol_mean"], dtype=torch.float) if stats["std_mol_mean"] is not None else None
+        std_mol_std  = torch.tensor(stats["std_mol_std"],  dtype=torch.float) if stats["std_mol_std"]  is not None else None
+        std_solv_mean = torch.tensor(stats["std_solv_mean"], dtype=torch.float) if stats["std_solv_mean"] is not None else None
+        std_solv_std  = torch.tensor(stats["std_solv_std"],  dtype=torch.float) if stats["std_solv_std"]  is not None else None
+        y_mean_log = stats["y_mean_log"] if stats["y_mean_log"] is not None else 0.0
+        y_std_log  = stats["y_std_log"]  if stats["y_std_log"]  is not None else 1.0
+        conc_mean  = stats["conc_mean"]  if stats["conc_mean"]  is not None else 0.0
+        conc_std   = stats["conc_std"]   if stats["conc_std"]   is not None else 1.0
 
-        # Обернём collate для применения стандартизации
-        def collate_and_standardize(items):
-            pack = collate_batch(items)
-            pack.num_feats = stdzr.transform(pack.num_feats)
-            return pack
+        # Fallbacks: compute from dataset if checkpoint lacks stats
+        if std_mol_mean is None or std_mol_std is None:
+            X_mol = torch.stack([ds[i].num_feats_mol for i in range(len(ds))], dim=0).float()
+            std_mol_mean = X_mol.mean(dim=0)
+            std_mol_std  = X_mol.std(dim=0).clamp_min(1e-8)
+            print("[!] std_mol_* not found in ckpt — fitted on input CSV (molecule).")
+        if std_solv_mean is None or std_solv_std is None:
+            X_solv = torch.stack([ds[i].num_feats_solv for i in range(len(ds))], dim=0).float()
+            std_solv_mean = X_solv.mean(dim=0)
+            std_solv_std  = X_solv.std(dim=0).clamp_min(1e-8)
+            print("[!] std_solv_* not found in ckpt — fitted on input CSV (solvent).")
 
-        loader = DataLoader(ds, batch_size=args.batch_size, shuffle=False, num_workers=0, collate_fn=collate_and_standardize)
-
-        # inverse-transform from z-log to original scale
-        y_mean_log = payload.get("y_mean_log", 0.0)
-        y_std_log  = payload.get("y_std_log", 1.0)
+        @torch.no_grad()
+        def transform_num_mol(x: torch.Tensor) -> torch.Tensor:
+            return (x - std_mol_mean) / std_mol_std.clamp_min(1e-8)
+        @torch.no_grad()
+        def transform_num_solv(x: torch.Tensor) -> torch.Tensor:
+            return (x - std_solv_mean) / std_solv_std.clamp_min(1e-8)
+        @torch.no_grad()
+        def transform_conc(x: torch.Tensor) -> torch.Tensor:
+            return (x - conc_mean) / max(conc_std, 1e-8)
         @torch.no_grad()
         def inverse_transform_pred(z: torch.Tensor) -> torch.Tensor:
             y_log = z * y_std_log + y_mean_log
             return torch.pow(10.0, y_log) - 1e-9
+
+        def collate_and_standardize(items):
+            pack = collate_batch(items)
+            pack.num_feats_mol = transform_num_mol(pack.num_feats_mol)
+            pack.num_feats_solv = transform_num_solv(pack.num_feats_solv)
+            if hasattr(pack, "conc") and pack.conc is not None:
+                pack.conc = transform_conc(pack.conc)
+            return pack
+
+        loader = DataLoader(ds, batch_size=args.batch_size, shuffle=False, num_workers=0, collate_fn=collate_and_standardize)
 
         model.eval()
         preds_all = []
@@ -206,12 +236,19 @@ def main():
             emb_atom, emb_frag, emb_fused = [], [], []
         for pack in loader:
             pack = to_device(pack, device)
-            out = model(atom_batch=pack.atom_batch, frag_batch=pack.frag_batch, num_feats=pack.num_feats,
-            ssl_mask_cfg=None, return_ssl=False)
-            z = out["pred"].squeeze(-1).detach().cpu()
-            preds_all.append(inverse_transform_pred(z).numpy())
+            out = model(
+                atom_batch=pack.atom_batch,
+                frag_batch=pack.frag_batch,
+                num_feats_mol=pack.num_feats_mol,
+                num_feats_solv=pack.num_feats_solv,
+                conc=getattr(pack, "conc", None),
+                ssl_mask_cfg=None,
+                return_ssl=False,
+            )
+            z = out["pred"].squeeze(-1)
+            preds_all.append(inverse_transform_pred(z).cpu().numpy())
             if args.save_embeddings:
-                emb = model.infer_embeddings(pack.atom_batch, pack.frag_batch, pack.num_feats)
+                emb = model.infer_embeddings(pack.atom_batch, pack.frag_batch, pack.num_feats_mol, pack.num_feats_solv)
                 emb_atom.append(emb["atom_vec"].detach().cpu().numpy())
                 emb_frag.append(emb["frag_vec"].detach().cpu().numpy())
                 emb_fused.append(emb["fused_vec"].detach().cpu().numpy())
@@ -221,7 +258,7 @@ def main():
                 "atom_vec": np.concatenate(emb_atom, axis=0),
                 "frag_vec": np.concatenate(emb_frag, axis=0),
                 "fused_vec": np.concatenate(emb_fused, axis=0),
-                }
+            }
             for k in agg_embeds.keys():
                 agg_embeds[k].append(embeds[k])
 
