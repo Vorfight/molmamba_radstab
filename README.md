@@ -1,4 +1,4 @@
-# Mol-Mamba (radiation stability) — end-to-end
+# Mol-Mamba для предсказания радиационной стабильности (dose constant)
 
 Полный пайплайн для регрессии **dose constant** из:
 - атомного графа молекулы (узлы=атомы, рёбра=связи) → **Mol-Mamba encoder** (GNN → упорядочивание → Mamba/GRU);
