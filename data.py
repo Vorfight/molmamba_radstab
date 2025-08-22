@@ -250,7 +250,6 @@ class Item:
     # Combined numeric features: [num_mol | num_solv] where
     #   num_mol  = RDKit descriptors of main molecule
     #   num_solv = RDKit descriptors of solvent + [diel_const]
-    num_feats: Tensor          # shape [D_all]
     num_feats_mol: Tensor      # shape [D_mol]
     num_feats_solv: Tensor     # shape [D_solv]
     conc: Tensor               # shape [1] (standardize outside)
@@ -314,12 +313,10 @@ class RadiationDataset(Dataset):
 
         numf_mol = numeric_features_mol(mol)
         numf_solv = numeric_features_solv(solv_mol, diel_const=diel)
-        numf_all = np.concatenate([numf_mol, numf_solv], axis=0)
 
         item = Item(
             atom_data=atom_data,
             frag_data=frag_data,
-            num_feats=torch.from_numpy(numf_all),
             num_feats_mol=torch.from_numpy(numf_mol),
             num_feats_solv=torch.from_numpy(numf_solv),
             conc=torch.tensor([conc], dtype=torch.float),
@@ -336,7 +333,6 @@ class RadiationDataset(Dataset):
 class BatchPack:
     atom_batch: Batch
     frag_batch: Batch
-    num_feats: Tensor       # [B, D_all] = concat([mol, solv])
     num_feats_mol: Tensor   # [B, D_mol]
     num_feats_solv: Tensor  # [B, D_solv]
     conc: Tensor            # [B, 1]
@@ -348,48 +344,64 @@ def collate_batch(items: List[Item]) -> BatchPack:
     frag_list = [it.frag_data for it in items]
     atom_batch = Batch.from_data_list(atom_list)
     frag_batch = Batch.from_data_list(frag_list)
-    num_feats = torch.stack([it.num_feats for it in items], dim=0)
     num_feats_mol = torch.stack([it.num_feats_mol for it in items], dim=0)
     num_feats_solv = torch.stack([it.num_feats_solv for it in items], dim=0)
     conc = torch.stack([it.conc for it in items], dim=0).view(-1, 1)  # [B,1]
     y = torch.stack([it.y for it in items], dim=0) if items[0].y is not None else None
     meta = [it.meta for it in items]
     return BatchPack(atom_batch=atom_batch, frag_batch=frag_batch,
-                     num_feats=num_feats, num_feats_mol=num_feats_mol, num_feats_solv=num_feats_solv,
+                     num_feats_mol=num_feats_mol, num_feats_solv=num_feats_solv,
                      conc=conc, y=y, meta=meta)
 
 # -----------------------------
 # Optional: feature standardizer (для числовых признаков)
 # -----------------------------
 class FeatureStandardizer:
-    """Простая стандартизация (x - mean) / std для комбинированных num_feats (молекула + растворитель). Хранит параметры."""
+    """Простая стандартизация (x - mean) / std для произвольного набора тензоров.
+    Можно вызывать fit на датасете по имени поля (num_feats_mol/num_feats_solv). Хранит параметры.
+    """
     def __init__(self):
         self.mean_: Optional[Tensor] = None
         self.std_: Optional[Tensor] = None
 
-    def fit(self, dataset: RadiationDataset, indices: Optional[List[int]] = None):
-        xs = []
-        if indices is None:
-            indices = list(range(len(dataset)))
-        for idx in indices:
-            xs.append(dataset[idx].num_feats)
-        X = torch.stack(xs, 0)
+    def fit(self, dataset: Optional[Dataset] = None, indices: Optional[List[int]] = None, field: str = None, X: Optional[Tensor] = None):
+        """Либо передайте X (Tensor [N, F]), либо dataset+field (строка: 'num_feats_mol' или 'num_feats_solv')."""
+        if X is None:
+            if dataset is None or field is None:
+                raise ValueError("Provide either X tensor or (dataset and field) to fit FeatureStandardizer")
+            if indices is None:
+                indices = list(range(len(dataset)))
+            xs = []
+            for idx in indices:
+                it = dataset[idx]
+                val = getattr(it, field)
+                xs.append(val)
+            X = torch.stack(xs, 0).float()
+        else:
+            if not torch.is_tensor(X):
+                X = torch.tensor(X, dtype=torch.float)
         self.mean_ = X.mean(dim=0)
-        self.std_ = X.std(dim=0).clamp_min(1e-6)
+        self.std_ = X.std(dim=0).clamp_min(1e-8)
         return self
 
-    def transform(self, num_feats: Tensor) -> Tensor:
-        assert self.mean_ is not None and self.std_ is not None, "Call fit() first"
-        return (num_feats - self.mean_) / self.std_
+    def transform(self, x: Tensor) -> Tensor:
+        assert self.mean_ is not None and self.std_ is not None, "Call fit() first or set mean_/std_ manually"
+        return (x - self.mean_) / self.std_
 
-    def fit_transform(self, dataset: RadiationDataset, indices: Optional[List[int]] = None) -> List[Tensor]:
-        self.fit(dataset, indices)
-        xs = []
-        if indices is None:
-            indices = list(range(len(dataset)))
-        for idx in indices:
-            xs.append(self.transform(dataset[idx].num_feats))
-        return xs
+    def fit_transform(self, dataset: Optional[Dataset] = None, indices: Optional[List[int]] = None, field: str = None, X: Optional[Tensor] = None) -> Tensor:
+        self.fit(dataset=dataset, indices=indices, field=field, X=X)
+        if X is None:
+            if dataset is None or field is None:
+                raise ValueError("Provide either X tensor or (dataset and field) to fit_transform FeatureStandardizer")
+            if indices is None:
+                indices = list(range(len(dataset)))
+            xs = []
+            for idx in indices:
+                it = dataset[idx]
+                val = getattr(it, field)
+                xs.append(val)
+            X = torch.stack(xs, 0).float()
+        return self.transform(X)
 
 # -----------------------------
 # Expose helper for scaffold-based CV (используем в utils.py)
