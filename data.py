@@ -260,21 +260,21 @@ class RadiationDataset(Dataset):
     """
     Ожидаемый CSV с колонками:
       - smiles (str)
-      - solv_smiles (str) [может быть пустым, пока не используется в признаках]
+      - solvent_smiles (str) [может быть пустым, пока не используется в признаках]
       - diel_const (float)
-      - conc_stand (float)
-      - dc_stand (float)  # таргет
+      - concentration (float)
+      - dose_constant (float)  # таргет
     """
     def __init__(self, csv_path: str):
         super().__init__()
         self.df = pd.read_csv(csv_path)
-        required = ["smiles", "diel_const", "conc_stand", "dc_stand"]
+        required = ["smiles", "diel_const", "concentration", "dose_constant"]
         for col in required:
             if col not in self.df.columns:
                 raise ValueError(f"CSV must contain column '{col}'")
-        # Опционально: solv_smiles
-        if "solv_smiles" not in self.df.columns:
-            self.df["solv_smiles"] = ""
+        # Опционально: solvent_smiles
+        if "solvent_smiles" not in self.df.columns:
+            self.df["solvent_smiles"] = ""
 
         # Expose sizes of NUM splits
         self.num_mol_dim = len(RDKit_DESC_FUNCS)
@@ -293,9 +293,9 @@ class RadiationDataset(Dataset):
         row = self.df.iloc[idx]
         smi = str(row["smiles"])
         diel = float(row["diel_const"])
-        conc = float(row["conc_stand"])
-        yval = float(row["dc_stand"])
-        solv = str(row.get("solv_smiles", ""))
+        conc = float(row["concentration"])
+        yval = float(row["dose_constant"])
+        solv = str(row.get("solvent_smiles", ""))
 
         mol = smiles_to_mol(smi)
         solv_mol = smiles_to_mol(solv) if isinstance(solv, str) and solv.strip() else None
@@ -321,7 +321,7 @@ class RadiationDataset(Dataset):
             num_feats_solv=torch.from_numpy(numf_solv),
             conc=torch.tensor([conc], dtype=torch.float),
             y=torch.tensor([yval], dtype=torch.float),
-            meta={"smiles": smi, "solv_smiles": solv, "diel_const": diel, "conc_stand": conc}
+            meta={"smiles": smi, "solvent_smiles": solv, "diel_const": diel, "concentration": conc}
         )
         self._cache[idx] = item
         return item

@@ -139,7 +139,7 @@ def infer_with_embeddings(model: DoseConstantPredictor, loader: DataLoader, devi
 
 def main():
     parser = argparse.ArgumentParser(description="Predict dose constant with trained model (single ckpt or ensemble).")
-    parser.add_argument("--csv", type=str, required=True, help="Path to input CSV with columns: smiles, (solv_smiles), diel_const, conc_stand, (dc_stand)")
+    parser.add_argument("--csv", type=str, required=True, help="Path to input CSV with columns: smiles, (solvent_smiles), diel_const, concentration, (dose_constant)")
     parser.add_argument("--ckpt", type=str, required=True, help="Path to a fold checkpoint .pt or a directory with fold*_best.pt")
     parser.add_argument("--out_csv", type=str, default="predictions.csv", help="Where to save predictions CSV")
     parser.add_argument("--batch_size", type=int, default=64)
@@ -271,9 +271,9 @@ def main():
     df = ds.df.copy()
     df["pred_dc"] = preds_ens
 
-    if "dc_stand" in df.columns:
+    if "dose_constant" in df.columns:
         try:
-            df["abs_error"] = (df["pred_dc"] - df["dc_stand"]).abs()
+            df["abs_error"] = (df["pred_dc"] - df["dose_constant"]).abs()
         except Exception:
             pass
 

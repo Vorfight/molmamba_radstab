@@ -197,7 +197,7 @@ def train_one_fold(
     # --- Target transform: log10 ---
     # Фитим стандартизатор по train-части в лог-шкале (опционально).
     # Если не хочешь стандартизировать таргет — просто оставь mean=0, std=1.
-    y_train_raw = torch.tensor([float(ds.df.iloc[i]["dc_stand"]) for i in train_idx], dtype=torch.float)
+    y_train_raw = torch.tensor([float(ds.df.iloc[i]["dose_constant"]) for i in train_idx], dtype=torch.float)
     y_train_log = y_to_log10(y_train_raw)
     y_mean = y_train_log.mean()
     y_std = y_train_log.std().clamp_min(1e-8)
@@ -210,7 +210,7 @@ def train_one_fold(
         return y_from_log10(y_hat_log)
 
     # --- Concentration standardization fit on train fold ---
-    conc_train = torch.tensor([float(ds.df.iloc[i]["conc_stand"]) for i in train_idx], dtype=torch.float)
+    conc_train = torch.tensor([float(ds.df.iloc[i]["concentration"]) for i in train_idx], dtype=torch.float)
     conc_mean = conc_train.mean()
     conc_std = conc_train.std().clamp_min(1e-8)
 
@@ -371,7 +371,7 @@ def train_one_fold(
 # =============================
 def main():
     parser = argparse.ArgumentParser(description="Supervised training with scaffold k-fold CV for dose constant regression")
-    parser.add_argument("--csv", type=str, required=True, help="Path to CSV (smiles, solv_smiles, diel_const, conc_stand, dc_stand)")
+    parser.add_argument("--csv", type=str, required=True, help="Path to CSV (smiles, solvent_smiles, diel_const, concentration, dose_constant)")
     parser.add_argument("--ssl_ckpt", type=str, default="", help="Optional path to SSL checkpoint (ssl_pretrained.pt)")
     parser.add_argument("--out_dir", type=str, default="runs")
     parser.add_argument("--folds", type=int, default=5)

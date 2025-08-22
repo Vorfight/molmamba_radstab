@@ -1,11 +1,12 @@
 # Mol-Mamba для предсказания радиационной стабильности (dose constant)
 
-Полный пайплайн для регрессии **dose constant** из:
-- атомного графа молекулы (узлы=атомы, рёбра=связи) → **Mol-Mamba encoder** (GNN → упорядочивание → Mamba/GRU);
+Пайплайн для регрессии **dose constant** состоит из:
+- атомного графа молекулы (узлы — атомы, рёбра — связи) → **Mol-Mamba encoder** (GNN → упорядочение → Mamba/GRU);
 - фрагментного графа (кольцевые системы) → **Frag GNN encoder**;
-- числовых фич (среда: `diel_const`, `conc_stand` + RDKit-дескрипторы молекулы);
-- **Mamba-Transformer fuser** для слияния `[ATOM | FRAG | NUM]`;
-- двухступенчатого SSL-предобучения (**SDA + e-semantic masked fusion**) и супервизед-обучения с **scaffold k-fold CV**.
+- числовых признаков молекулы и растворителя (раздельные векторы, включая молекулярные дескрипторы и параметры среды);
+- **Mamba-Transformer fuser** для слияния `[ATOM | FRAG | NUM_mol | NUM_solvent]`;
+- двухступенчатого SSL-предобучения (SDA + e-semantic masked fusion) на молекуле (граф и молекулярные дескрипторы);
+- файнтюнинга с **scaffold k-fold CV**.
 
 ## Дерево проекта
 ```
@@ -24,6 +25,7 @@ molmamba_radstab/
 ├── requirements.txt
 └── runs/                 # создаётся автоматически
 ```
+
 ## Установка
 ```bash
 conda create -n molmamba_radstab python=3.10 -y
@@ -34,75 +36,71 @@ pip install -r requirements.txt
 ## Формат данных
 
 Входной CSV (пример data.csv):
-- smiles — SMILES молекулы (строка, обязателен)
-- solv_smiles — SMILES растворителя (строка, опционально — пока не используется)
+- smiles — SMILES молекулы (строка, обязательно)
+- solvent_smiles — SMILES растворителя (строка, опционально, не используется в модели)
 - diel_const — диэлектрическая проницаемость растворителя (float)
-- conc_stand — концентрация, моль/л (float)
-- dc_stand — целевой dose constant (float), опционален для инференса
+- concentration — концентрация, моль/л (float)
+- dose_constant — целевой dose constant (float), опционален для инференса
 
-Минимум для предсказания: smiles, diel_const, conc_stand.
+Минимальный набор для предсказания: smiles, diel_const, concentration.
 
 ## Предобучение (SSL)
 
-Две стадии: SDA (CORAL-выравнивание атом/фрагмент) и Masked Fusion (реконструкция NUM-фич).
+Две стадии: SDA (CORAL-выравнивание атом/фрагмент) и Masked Fusion (реконструкция молекулярных дескрипторов). Предобучение проводится только на молекуле, без использования данных растворителя.
+
 ```bash
 python ssl_pretrain.py --csv data.csv --batch_size 16 \
   --epochs_sda 50 --epochs_mask 80 \
   --ckpt ssl_pretrained.pt
 ```
-Скрипт сохранит веса модели и параметры стандартизации числовых фич.
 
 ## Обучение с scaffold k-fold CV
+
 ```bash
 python train.py --csv data.csv --ssl_ckpt ssl_pretrained.pt \
   --folds 5 --epochs 300 --out_dir runs
 ```
-Что делает:
-- фолды по **Bemis–Murcko scaffold** (честная валидация по каркасам);
-- стандартизация числовых фич **по train фолда**;
-- early stopping по `val_RMSE`;
-- сохраняет `runs/fold{k}_best.pt` и `runs/cv_summary.json`.
 
-Полезные флаги:
-- `--d_model 128` и/или `--dropout 0.2-0.4` для маленьких датасетов (у тебя 44 образца);
-- `--folds 11` (мелкие scaffold-группы) — как LOO по каркасам;
-- `--weight_decay 1e-3…1e-2`, `--patience 15-25` для жёстче ранней остановки.
+Особенности:
+- фолды формируются по **Bemis–Murcko scaffold**;
+- стандартизация числовых фич выполняется по train фолду;
+- применяется ранняя остановка по `val_RMSE`;
+- сохраняются модели `runs/fold{k}_best.pt` и отчёты `runs/cv_summary.json`.
 
 ## Предсказания
 
-Один чекпоинт:
+Для одного чекпоинта:
 ```bash
 python predict.py --csv data.csv --ckpt runs/fold1_best.pt --out_csv preds.csv
 ```
+
 Ансамбль по всем фолдам в директории:
 ```bash
 python predict.py --csv data.csv --ckpt runs/ --out_csv preds_ens.csv
 ```
-Опционально сохранить эмбеддинги:
+
+Опционально можно сохранить эмбеддинги:
 ```bash
 python predict.py --csv data.csv --ckpt runs/ --out_csv preds.csv \
   --save_embeddings --embeddings_path embeds.npz
 ```
-Выходной CSV добавит pred_dc; если есть dc_stand, также abs_error.
 
+Выходной CSV содержит предсказания `pred_dc`; при наличии `dose_constant` дополнительно рассчитывается `abs_error`.
 
-## Гиперпараметры (рекомендации)
+## Гиперпараметры
 
-| Параметр          | Значение по умолчанию | Заметки |
-|-------------------|-----------------------|---------|
-| `d_model`         | 256 (или 128)         | 128 на маленьком датасете — стабильнее |
-| `gnn_layers`      | 3                     | 2–4 обычно достаточно |
-| `dropout`         | 0.1 (0.2–0.4)         | Увеличить для 44 образцов |
-| `lr`              | 2e-4                  | AdamW, cosine scheduler |
-| `weight_decay`    | 1e-4 (1e-3…1e-2)      | Сильнее L2 = меньше переобучения |
-| `folds`           | 5 (или 11)            | Scaffold-CV |
-
+| Параметр          | Значение по умолчанию |
+|-------------------|-----------------------|
+| `d_model`         | 256                   |
+| `gnn_layers`      | 3                     |
+| `dropout`         | 0.1                   |
+| `lr`              | 2e-4                  |
+| `weight_decay`    | 1e-4                  |
+| `folds`           | 5                     |
 
 ## Метрики
 
-- **RMSE**, **MAE**, **R²** — печатаются по каждому фолду и итогу CV.  
+- **RMSE**, **MAE**, **R²** — вычисляются по каждому фолду и по итогам CV.
 - Отчёты сохраняются в:
   - `runs/fold{k}_metrics.json`
   - `runs/cv_summary.json`
-
-

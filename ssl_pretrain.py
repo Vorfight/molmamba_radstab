@@ -212,7 +212,7 @@ def run_stage2_masked_fusion(
 # -----------------------------
 def main():
     parser = argparse.ArgumentParser(description="Two-stage SSL pretraining: SDA + E-semantic masked fusion")
-    parser.add_argument("--csv", type=str, required=True, help="Path to CSV with columns: smiles, solv_smiles, diel_const, conc_stand, dc_stand")
+    parser.add_argument("--csv", type=str, required=True, help="Path to CSV with columns: smiles, solvent_smiles, diel_const, concentration, dose_constant")
     parser.add_argument("--batch_size", type=int, default=16)
     parser.add_argument("--epochs_sda", type=int, default=50)
     parser.add_argument("--epochs_mask", type=int, default=80)
