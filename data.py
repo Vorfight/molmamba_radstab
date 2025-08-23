@@ -268,13 +268,18 @@ class RadiationDataset(Dataset):
     def __init__(self, csv_path: str):
         super().__init__()
         self.df = pd.read_csv(csv_path)
-        required = ["smiles", "diel_const", "concentration", "dose_constant"]
-        for col in required:
-            if col not in self.df.columns:
-                raise ValueError(f"CSV must contain column '{col}'")
-        # Опционально: solvent_smiles
+        # Требуем только SMILES молекулы; остальные колонки опциональны и заполняются безопасными значениями
+        if "smiles" not in self.df.columns:
+            raise ValueError("CSV must contain column 'smiles'")
         if "solvent_smiles" not in self.df.columns:
             self.df["solvent_smiles"] = ""
+        if "diel_const" not in self.df.columns:
+            self.df["diel_const"] = 0.0
+        if "concentration" not in self.df.columns:
+            self.df["concentration"] = 0.0
+        if "dose_constant" not in self.df.columns:
+            # таргет может отсутствовать на инференсе/SSL-предобучении
+            self.df["dose_constant"] = np.nan
 
         # Expose sizes of NUM splits
         self.num_mol_dim = len(RDKit_DESC_FUNCS)
@@ -292,10 +297,18 @@ class RadiationDataset(Dataset):
 
         row = self.df.iloc[idx]
         smi = str(row["smiles"])
-        diel = float(row["diel_const"])
-        conc = float(row["concentration"])
-        yval = float(row["dose_constant"])
+        diel = safe_float(row.get("diel_const", 0.0))
+        conc = safe_float(row.get("concentration", 0.0))
+        y_raw = row.get("dose_constant", np.nan)
         solv = str(row.get("solvent_smiles", ""))
+        y_tensor: Optional[Tensor]
+        if pd.isna(y_raw):
+            y_tensor = None
+        else:
+            try:
+                y_tensor = torch.tensor([float(y_raw)], dtype=torch.float)
+            except Exception:
+                y_tensor = None
 
         mol = smiles_to_mol(smi)
         solv_mol = smiles_to_mol(solv) if isinstance(solv, str) and solv.strip() else None
@@ -320,7 +333,7 @@ class RadiationDataset(Dataset):
             num_feats_mol=torch.from_numpy(numf_mol),
             num_feats_solv=torch.from_numpy(numf_solv),
             conc=torch.tensor([conc], dtype=torch.float),
-            y=torch.tensor([yval], dtype=torch.float),
+            y=y_tensor,
             meta={"smiles": smi, "solvent_smiles": solv, "diel_const": diel, "concentration": conc}
         )
         self._cache[idx] = item
@@ -347,7 +360,8 @@ def collate_batch(items: List[Item]) -> BatchPack:
     num_feats_mol = torch.stack([it.num_feats_mol for it in items], dim=0)
     num_feats_solv = torch.stack([it.num_feats_solv for it in items], dim=0)
     conc = torch.stack([it.conc for it in items], dim=0).view(-1, 1)  # [B,1]
-    y = torch.stack([it.y for it in items], dim=0) if items[0].y is not None else None
+    has_y = all(it.y is not None for it in items)
+    y = torch.stack([it.y for it in items], dim=0) if has_y else None
     meta = [it.meta for it in items]
     return BatchPack(atom_batch=atom_batch, frag_batch=frag_batch,
                      num_feats_mol=num_feats_mol, num_feats_solv=num_feats_solv,

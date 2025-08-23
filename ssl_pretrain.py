@@ -46,10 +46,16 @@ def freeze_module(m: nn.Module, freeze: bool = True):
 
 def save_checkpoint(path: str, model: DoseConstantPredictor, stdzr: FeatureStandardizer, args: Dict[str, Any]):
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    mol_mean = stdzr.mean_.cpu().numpy() if stdzr.mean_ is not None else None
+    mol_std = stdzr.std_.cpu().numpy() if stdzr.std_ is not None else None
     payload = {
         "model_state_dict": model.state_dict(),
-        "standardizer_mean": stdzr.mean_.cpu().numpy() if stdzr.mean_ is not None else None,
-        "standardizer_std": stdzr.std_.cpu().numpy() if stdzr.std_ is not None else None,
+        # legacy keys (train.py can read these)
+        "standardizer_mean": mol_mean,
+        "standardizer_std": mol_std,
+        # explicit keys for molecular standardizer (new API)
+        "std_mol_mean": mol_mean,
+        "std_mol_std": mol_std,
         "args": args,
     }
     torch.save(payload, path)
@@ -235,10 +241,11 @@ def main():
     set_seed(args.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # Standardize ONLY the molecular NUM part for SSL (solvent is excluded from SSL losses)
+    ds = RadiationDataset(args.csv)
+
     stdzr = FeatureStandardizer()
     with torch.no_grad():
-        X = torch.stack([RadiationDataset(args.csv)[i].num_feats_mol for i in range(len(ds))], dim=0).float()
+        X = torch.stack([ds[i].num_feats_mol for i in range(len(ds))], dim=0).float()
         stdzr.mean_ = X.mean(dim=0)
         stdzr.std_ = X.std(dim=0).clamp_min(1e-8)
 
@@ -247,8 +254,6 @@ def main():
         pack.num_feats_mol = stdzr.transform(pack.num_feats_mol)
         # pack.num_feats_solv не трогаем в SSL
         return pack
-
-    ds = RadiationDataset(args.csv)
 
     loader = DataLoader(
         ds, batch_size=args.batch_size, shuffle=True,

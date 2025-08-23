@@ -117,6 +117,7 @@ def build_model_from_loader(loader: DataLoader, d_model: int, gnn_layers: int, d
     return model
 
 
+
 def try_load_ssl_checkpoint(model: DoseConstantPredictor, standardizer_mol: FeatureStandardizer, ckpt_path: str):
     if not ckpt_path or not os.path.isfile(ckpt_path):
         print(f"[i] SSL checkpoint not provided or not found: {ckpt_path}")
@@ -136,6 +137,27 @@ def try_load_ssl_checkpoint(model: DoseConstantPredictor, standardizer_mol: Feat
         standardizer_mol.mean_ = torch.tensor(mean_np, dtype=torch.float)
         standardizer_mol.std_ = torch.tensor(std_np, dtype=torch.float)
         print("[✓] Loaded MOLECULAR feature standardizer stats from SSL checkpoint.")
+
+
+# --- Helper: load molecular standardizer from SSL checkpoint if available ---
+def load_ssl_standardizer(standardizer_mol: FeatureStandardizer, ckpt_path: str) -> bool:
+    """Load molecular feature standardizer stats from SSL checkpoint if present.
+    Returns True if loaded, False otherwise.
+    """
+    if not ckpt_path or not os.path.isfile(ckpt_path):
+        return False
+    payload = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    mean_np = payload.get("std_mol_mean", None)
+    std_np = payload.get("std_mol_std", None)
+    if mean_np is None or std_np is None:
+        # legacy keys for backward compatibility
+        mean_np = payload.get("standardizer_mean", None)
+        std_np = payload.get("standardizer_std", None)
+    if mean_np is None or std_np is None:
+        return False
+    standardizer_mol.mean_ = torch.tensor(mean_np, dtype=torch.float)
+    standardizer_mol.std_ = torch.tensor(std_np, dtype=torch.float)
+    return True
 
 
 def evaluate(model: DoseConstantPredictor, loader: DataLoader, device: torch.device, inverse_transform_y) -> Dict[str, float]:
@@ -193,6 +215,14 @@ def train_one_fold(
     # Standardizers: molecular (from SSL), solvent (fit on train)
     stdzr_mol = FeatureStandardizer()   # from SSL
     stdzr_solv = FeatureStandardizer()  # fit on train
+
+    # Initialize molecular standardizer early: try SSL stats, else fit on train fold
+    loaded_mol_std = load_ssl_standardizer(stdzr_mol, args.ssl_ckpt)
+    if not loaded_mol_std:
+        with torch.no_grad():
+            X_mol = torch.stack([ds[i].num_feats_mol for i in train_idx], dim=0).float()
+            stdzr_mol.mean_ = X_mol.mean(dim=0)
+            stdzr_mol.std_ = X_mol.std(dim=0).clamp_min(1e-8)
 
     # --- Target transform: log10 ---
     # Фитим стандартизатор по train-части в лог-шкале (опционально).
@@ -259,7 +289,12 @@ def train_one_fold(
     else:
         scheduler = None
 
-    best_val_rmse = float("inf")
+    # Select best epoch criterion
+    if args.select_by == "rmse":
+        best_val_score = float("-inf")
+        best_val_score = float("inf")
+    else:  # r2
+        best_val_score = -float("inf")
     best_state = None
     epochs_no_improve = 0
 
@@ -304,9 +339,14 @@ def train_one_fold(
 
         print(f"[Fold {fold_id}] Epoch {epoch:03d} | train_MSE: {train_loss:.6f} | val_RMSE: {val_rmse:.6f} | val_MAE: {val_metrics['MAE']:.6f} | val_R2: {val_metrics['R2']:.4f}")
 
-        # Early stopping
-        if val_rmse + 1e-9 < best_val_rmse:
-            best_val_rmse = val_rmse
+        # Early stopping/select best epoch by criterion
+        if args.select_by == "rmse":
+            current_score = -val_metrics["RMSE"]  # negate because lower is better
+        else:
+            current_score = val_metrics["R2"]     # higher is better
+
+        if current_score > best_val_score + 1e-9:
+            best_val_score = current_score
             best_state = {
                 "model": model.state_dict(),
                 "std_mol_mean": stdzr_mol.mean_.cpu().numpy().tolist() if hasattr(stdzr_mol, "mean_") else None,
@@ -381,6 +421,8 @@ def main():
     parser.add_argument("--weight_decay", type=float, default=1e-4)
     parser.add_argument("--scheduler", type=str, default="cosine", choices=["none", "cosine"])
     parser.add_argument("--patience", type=int, default=50)
+    parser.add_argument("--select_by", type=str, default="rmse", choices=["rmse", "r2"],
+                        help="Criterion for selecting the best epoch: rmse (minimize) or r2 (maximize)")
     parser.add_argument("--d_model", type=int, default=256)
     parser.add_argument("--gnn_layers", type=int, default=3)
     parser.add_argument("--dropout", type=float, default=0.1)

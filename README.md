@@ -40,7 +40,7 @@ pip install -r requirements.txt
 - solvent_smiles — SMILES растворителя (строка, опционально, не используется в модели)
 - diel_const — диэлектрическая проницаемость растворителя (float)
 - concentration — концентрация, моль/л (float)
-- dose_constant — целевой dose constant (float), опционален для инференса
+- dose_constant — целевой dose constant (float), опционален для инференса, при наличии будет рассчитан `abs_error`
 
 Минимальный набор для предсказания: smiles, diel_const, concentration.
 
